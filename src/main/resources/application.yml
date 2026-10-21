@@ -1,0 +1,184 @@
+# ===================================================================
+#  RAG Study Helper - Application Configuration
+# ===================================================================
+
+server:
+  port: 8083
+
+# ===================================================================
+#  API 密钥
+#  注意: DeepSeek 只支持对话，不支持 Embedding。
+#  因此需要为 Embedding 额外配置一个支持 OpenAI 兼容 Embedding 的提供商。
+#  如 OpenAI (text-embedding-3-small)、SiliconFlow、DashScope 等。
+# ===================================================================
+app:
+  rag:
+    # DeepSeek Chat API 密钥（可设为环境变量 APP_RAG_CHAT_API_KEY）
+    chat-api-key:
+    # Chat 模型地址（支持任意 OpenAI 兼容 API）
+    chat-base-url: https://api.deepseek.com
+    # Chat 模型名称
+    chat-model-name: deepseek-chat
+    # Embedding API 密钥（可设为环境变量 APP_RAG_EMBEDDING_API_KEY）
+    embedding-api-key:
+    # Embedding 模型地址 （支持任意 OpenAI 兼容 API，选用硅基流动的模型）
+    embedding-base-url: https://api.siliconflow.cn/v1
+    # Embedding 模型名称
+    embedding-model-name: BAAI/bge-large-zh-v1.5
+    # Rerank API 密钥（默认复用 Embedding key，可单独设置 APP_RAG_RERANK_API_KEY）
+    rerank-api-key: ${app.rag.embedding-api-key}
+    # Rerank 模型地址
+    rerank-base-url: https://api.siliconflow.cn/v1
+    # Rerank 模型名称
+    rerank-model-name: BAAI/bge-reranker-v2-m3
+    # 向量检索分数阈值（≥此值的文档会进入 Rerank 阶段，建议 0.75-0.85），我写 0.77 是因为进过多次测试，效果比较好
+    score-threshold: 0.77
+    # 启动时自动扫描的文档目录
+    document-scan-path: data/docs
+  # ===================================================================
+  #  限流配置（通过注解影响 接口，支持热更新）
+  #  可通过环境变量覆盖，如 APP_RATE_LIMIT_IP_RATE=10
+  # ===================================================================
+  rate-limit:
+    ip-rate: 20                            # IP 令牌桶容量（次/补充周期）
+    ip-supplement-seconds: 60              # IP 令牌桶补充周期（秒）
+    ip-expire-hours: 24                    # IP 令牌桶 Redis key 过期时间（小时）
+    daily-max: 10000                       # 全局每日调用上限
+
+  # ===================================================================
+  #  异步线程池配置
+  #  两个池职责分离：ingest 处理长任务入库，rag 处理短任务并行子查询
+  # ===================================================================
+  async:
+    ingest:
+      core-size: 2                         # 核心线程数（入库是 IO 密集，不占 CPU）
+      max-size: 4                          # 最大线程数（限制并发入库，避免打满 Embedding 配额）
+      queue-capacity: 200                  # 队列容量（满了走 CallerRunsPolicy，退化为同步）
+    rag:
+      core-size: 8                         # 核心线程数（问答并行子任务）
+      max-size: 32                         # 最大线程数（对外部 API 并发的上限保护）
+      queue-capacity: 500                  # 队列容量（满了抛异常，调用方降级串行）
+    embedding-batch-size: 10               # 单批 Embedding 条数
+    embedding-parallelism: 4               # 并行 Embedding 的并发度上限
+
+  # ===================================================================
+  #  缓存配置（Spring Cache + Redis）
+  #  三个缓存区各有不同 TTL，依据见 CacheConfig 注释
+  # ===================================================================
+  cache:
+    key-prefix: "rag:cache:"               # Redis key 前缀，便于与其他业务隔离
+    documents-ttl-minutes: 10              # 文档列表：主要靠主动失效，TTL 兜底
+    embedding-ttl-hours: 24                # Embedding 结果：幂等，可长存（兼作换模型的自愈口）
+    retrieval-ttl-minutes: 5               # 检索结果：知识库随时变化，TTL 必须短
+
+# ===================================================================
+#  向量数据库配置（三选一）
+#  通过 vector.store.type 切换
+#  生产不要用 in-memory
+# ===================================================================
+vector:
+  store:
+    type: in-memory    # 可选值: in-memory | chroma | milvus
+
+# ----- InMemory（小项目/开发测试）-----
+# 进程内内存存储，无需任何外部服务
+# 应用重启后数据丢失，适合开发调试
+# 无需额外配置
+
+# ----- Chroma（中型项目）-----
+chroma:
+  host: localhost                         # Chroma 服务地址
+  port: 8000                              # Chroma 服务端口
+  collection-name: rag_study_helper               # 集合名称
+
+# ----- Milvus（大型/生产）-----
+milvus:
+  host: localhost                         # Milvus 服务地址
+  port: 19530                             # Milvus 服务端口
+  collection-name: rag_study_helper               # 集合名称
+  dimension: 1024                         # 向量维度（需与 embedding 模型匹配） text-embedding-3-small:1536  BAAI/bge-large-zh-v1.5:1024
+
+# ===================================================================
+#  langchain4j配置
+# ===================================================================
+langchain4j:
+  open-ai:
+    chat-model:
+      api-key: ${app.rag.chat-api-key}
+      base-url: ${app.rag.chat-base-url}
+      model-name: ${app.rag.chat-model-name}
+      temperature: 1.0                    # DeepSeek 推荐值（0-2）
+
+    # ===================================================================
+    #  推荐服务：
+    #    SiliconFlow（免费额度）:
+    #      base-url: https://api.siliconflow.cn/v1
+    #      model: BAAI/bge-large-zh-v1.5
+    #
+    #    OpenAI:
+    #      base-url: https://api.openai.com/v1
+    #      model: text-embedding-3-small
+    #
+    #    DashScope（阿里云）:
+    #      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    #      model: text-embedding-v1
+    # ===================================================================
+    embedding-model:
+      api-key: ${app.rag.embedding-api-key}
+      base-url: ${app.rag.embedding-base-url}
+      model-name: ${app.rag.embedding-model-name}
+
+    # ===================================================================
+    #  Rerank 模型（SiliconFlow BGE Reranker）
+    #  对向量检索结果进行语义重排序，提高送入 LLM 的文档质量
+    #  与 Embedding 共用同一服务商（SiliconFlow）
+    # ===================================================================
+    rerank-model:
+      api-key: ${app.rag.rerank-api-key}
+      base-url: ${app.rag.rerank-base-url}
+      model-name: ${app.rag.rerank-model-name}
+
+# ===================================================================
+#  Redis 配置（用于对话上下文存储）
+# ===================================================================
+spring:
+  redis:
+    host: localhost
+    port: 6379
+    password:
+    timeout: 3000
+    lettuce:
+      pool:
+        max-active: 8
+        max-idle: 4
+        min-idle: 0
+
+  # ===================================================================
+  #  MySQL 数据源配置（用于文档元数据存储）
+  # ===================================================================
+  datasource:
+    url: jdbc:mysql://localhost:3306/rag_study_helper?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: ${SPRING_DATASOURCE_PASSWORD:123456}   # 本机实际密码通过环境变量 SPRING_DATASOURCE_PASSWORD 传入
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      minimum-idle: 4
+      maximum-pool-size: 12
+
+  servlet:
+    multipart:
+      max-file-size: 50MB                 # 单文件最大体积
+      max-request-size: 50MB              # 单次请求最大体积
+
+# ===================================================================
+#  MyBatis-Plus 配置
+# ===================================================================
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.rag.studyhelper.model
+  global-config:
+    db-config:
+      id-type: auto
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
