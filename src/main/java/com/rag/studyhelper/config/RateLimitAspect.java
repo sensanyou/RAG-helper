@@ -48,6 +48,12 @@ public class RateLimitAspect {
     /**
      * 聊天接口限流
      * 定制化 支持热更新
+     * <p>
+     * V2：限流维度从 IP 改为「登录用户优先」。
+     * 多用户下按 IP 限流有两个问题：
+     * 同一公司/校园网的多个学生共享出口 IP，一人用光大家遭殃；
+     * 而同一人换网络就能绕开 IP 限制。登录体系建立后，
+     * userId 才是"请求到底是谁发的"的准确维度，IP 仅作未认证兜底。
      */
     @Around("@annotation(ipRateLimit)")
     public Object chatAround(ProceedingJoinPoint pjp, IpRateLimit ipRateLimit) throws Throwable {
@@ -65,10 +71,15 @@ public class RateLimitAspect {
             return null;
         }
 
-        // 2. IP 令牌桶限流
-        String clientIp = getClientIp(request);
-        if (!rateLimitService.tryAcquire("ip:" +  key + ":" + clientIp, ipRate, ipSupplementSeconds, ipExpireHours)) {
-            writeRateLimitResponse(response, "请求过于频繁，请稍后再试");
+        // 2. 令牌桶：登录用户按 userId 维度，兜底按 IP
+        Long userId = com.rag.studyhelper.context.UserContext.currentOrNull();
+        String bucketKey = userId != null
+                ? "user:" + key + ":" + userId
+                : "ip:" + key + ":" + getClientIp(request);
+        if (!rateLimitService.tryAcquire(bucketKey, ipRate, ipSupplementSeconds, ipExpireHours)) {
+            writeRateLimitResponse(response, userId != null
+                    ? "你的请求过于频繁，请稍后再试"
+                    : "请求过于频繁，请稍后再试");
             return null;
         }
 

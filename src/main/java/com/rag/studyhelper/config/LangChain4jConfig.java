@@ -1,10 +1,6 @@
 package com.rag.studyhelper.config;
 
-import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.openai.*;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.chroma.ChromaEmbeddingStore;
-import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 import dev.langchain4j.store.embedding.milvus.MilvusEmbeddingStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -40,35 +36,6 @@ public class LangChain4jConfig {
 
     @Value("${langchain4j.open-ai.embedding-model.model-name}")
     private String embeddingModelName;
-
-    // ── InMemory (small / dev) ──
-    // 没有配置的时候默认使用 InMemory 但生产环境不建议用这个配置，可以删掉，开发环境可以自己玩
-    @Bean
-    @ConditionalOnProperty(name = "vector.store.type", havingValue = "in-memory", matchIfMissing = true)
-    public EmbeddingStore<TextSegment> inMemoryEmbeddingStore() {
-        return new InMemoryEmbeddingStore<>();
-    }
-
-    // ── Chroma (medium) ──
-
-    @Value("${chroma.host:localhost}")
-    private String chromaHost;
-
-    @Value("${chroma.port:8000}")
-    private Integer chromaPort;
-
-    @Value("${chroma.collection-name:rag_study_helper}")
-    private String chromaCollectionName;
-
-    @Bean
-    @ConditionalOnProperty(name = "vector.store.type", havingValue = "chroma")
-    @Lazy
-    public EmbeddingStore<TextSegment> chromaEmbeddingStore() {
-        return ChromaEmbeddingStore.builder()
-                .baseUrl("http://" + chromaHost + ":" + chromaPort)
-                .collectionName(chromaCollectionName)
-                .build();
-    }
 
     // ── Milvus (large / production) ──
 

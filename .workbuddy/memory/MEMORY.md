@@ -14,7 +14,11 @@
 - **Redis 不是 Windows 服务，不会开机自启**。启动报 `RedisConnectionException: Unable to connect ... 6379` 时，第一件事就是确认 Redis 有没有起来（`netstat -ano | grep 6379`）。进程异常退出会留 `redis_6379.pid`，启动前删掉即可（不影响 `dump.rdb`）。
 - `mvn dependency:tree` 在本机**离线模式不可用**（插件自身依赖未下载）。排查依赖来源改用 grep `~/.m2/repository` 下的 `*.pom` 反查。
 - 应用端口已改为 **8083**（8080 被 `ApplicationWebServer` 占用）。启动 jar 前必须显式设 `SERVER_PORT=8083`（沙箱会注入 63724 干扰）。
-- 向量库默认 `in-memory`，重启丢向量（已加 `vectorStoreHasData()` 探测 + 自动重建）。
+- 向量库已改为 **Milvus-only**（2026-10-25 用户明确"我要用milvus"）：`vector.store.type=milvus`，in-memory/chroma 的 bean、配置段、pom 依赖已全部删除。
+- **Docker Desktop 装在用户目录**：`C:\Users\hp\AppData\Local\Programs\DockerDesktop\`（WSL2 后端，发行版 `docker-desktop`）。沙箱 PATH 里没有 docker，调用要全路径：`/c/Users/hp/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe`，且需把该 bin 目录加进 PATH 才能找到 `docker-credential-desktop`（否则拉镜像报 credentials 错误）。
+- **MinIO 镜像国内全部"not found"**（官方已从国内镜像站下架）；Milvus **内嵌 etcd 模式在 Docker Desktop/WSL2 下启动即 SIGSEGV panic**（v2.3.3 与 v2.4.15 都试过）。最终方案：**独立 etcd 容器（quay.io 直连可用）+ `COMMON_STORAGETYPE=local` 本地存储**，docker-compose.yml 已按此改写，启动 `docker compose up -d etcd milvus`。
+- Milvus API Key 等密钥在 `start.bat` 里以环境变量注入（APP_RAG_CHAT_API_KEY / APP_RAG_EMBEDDING_API_KEY），命令行启动 jar 时要带上。
+- 认证头是标准 `Authorization: Bearer <token>`（或 `X-Auth-Token`）；register 响应里的 `tokenHeader:"auth.token"` 是内部常量名，不是请求头名。
 - **本机外网受限**：`cdn.jsdelivr.net` SSL 握手失败（curl exit 35），`cdn.bootcdn.net` 可用。前端所有第三方库必须本地化到 `static/vendor/`，不要用 jsdelivr/googleapis。
 
 ## Git / GitHub
@@ -25,6 +29,9 @@
 - `logs/` 已加入 `.gitignore` 并移出跟踪，运行日志不进版本库。
 
 ## 已完成的改造
+
+- 2026-10-25：**多用户改造 + Milvus 迁移全链路验证通过**——注册/登录（PBKDF2+token）、owner_id 全链路隔离（MySQL 唯一键 + Milvus metadata filter + 缓存/会话 key 含 userId）、任务化异步上传（PENDING/PROCESSING/COMPLETED/FAILED + 重试）、SSE sources 可追溯（真实分数+文件名）。E2E：401 拦截 ✓、A/B 隔离 ✓、A 检索命中 score=0.843 ✓、B 检索为空 ✓、异步任务 PENDING→COMPLETED ✓。
+- 2026-10-25：向量库切 Milvus-only（删 in-memory/chroma bean+配置+依赖），docker-compose 改 etcd+本地存储（无 MinIO），Milvus 镜像 v2.4.15。
 
 - 2026-10-21：移除飞书同步模块（5 个类 + 配置 + 表字段）。
 - 2026-10-21：修复前端"上传失败"误报——marked.js 本地化 + `mdRender()` 降级 + 字体异步加载 + 上传错误提示增强。

@@ -14,6 +14,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
@@ -23,16 +24,18 @@ import java.util.stream.Collectors;
  * <ul>
  *   <li>问题重写 → {@link QueryRewriteService}</li>
  *   <li>向量化 → {@link CachedEmbeddingService}（带 Redis 缓存）</li>
- *   <li>向量检索 + 阈值过滤 + 重排 → {@link RetrievalService}（带 Redis 缓存）</li>
+ *   <li>向量检索 + 阈值过滤 + 重排 → {@link RetrievalService}（带 Redis 缓存 + 用户隔离）</li>
  *   <li>多轮上下文 → {@link ConversationStore}</li>
  * </ul>
  * <p>
- * <b>为什么检索要单独拆到 RetrievalService？</b>
- * 因为 Spring Cache（{@code @Cacheable}）依赖 AOP 代理，
- * 而"同一个类内部调用自己的方法"会走 this 引用、绕过代理、注解静默失效。
- * 最初把 retrieve() 写在本类里，结果缓存从来没命中过、Redis 里一个 key 都没有、
- * 也不报任何错——这是最难排查的一类 bug。
- * 拆成独立 Bean 后，调用跨过代理边界，缓存才真正生效。
+ * <b>V2 变更</b>：
+ * <ul>
+ *   <li>全链路带 userId——检索按用户过滤，会话按用户隔离；</li>
+ *   <li>新增 {@code onRetrieved} 回调：检索完成后、生成开始前，
+ *       把命中的片段（含相似度分数）交给调用方。
+ *       Controller 用它通过 SSE 的 {@code sources} 事件把引用先推给前端，
+ *       实现"回答可追溯"——用户看到答案的同时能看到它依据了哪些资料。</li>
+ * </ul>
  */
 @Service
 public class RagQueryService {
@@ -54,18 +57,23 @@ public class RagQueryService {
     @Autowired
     private RetrievalService retrievalService;
 
-    public void streamAnswer(String sessionId, String question, StreamingResponseHandler<AiMessage> callback) {
-        // 获取历史上下文
-        List<ChatMessage> history = conversationStore.getHistory(sessionId);
+    /**
+     * @param sessionId    会话 ID（前端生成；隔离由 userId 保证）
+     * @param userId       当前用户（认证拦截器解析，非前端传入）
+     * @param question     用户问题
+     * @param onRetrieved  检索完成回调，可为 null；用于推送引用来源
+     * @param callback     LLM 流式输出回调
+     */
+    public void streamAnswer(long userId, String sessionId, String question,
+                             Consumer<List<RetrievedChunk>> onRetrieved,
+                             StreamingResponseHandler<AiMessage> callback) {
+        // 获取历史上下文（按用户隔离的会话历史）
+        List<ChatMessage> history = conversationStore.getHistory(userId, sessionId);
         // 提问小于 5 个字，进行问题重写，为了使 RAG 检索更准确
-        // 比如 RAG 场景下 你通过 《如何学习JAVA》 这个文档去检索（如果不了解向量数据库和embedding就先别管，只看问题）
-        // 你第一次问："java 要学什么框架"
-        // embedding 根据 "java 要学什么框架" 转成向量去检索到了相应的内容再放进 prompt 喂给 LLM
-        // LLM 根据文档说："springboot"
-        // 你第二次问："他有什么好处"
-        // 我们可以一眼就看出这里的他指的是 springboot ，但是 embedding 模型不知道
-        // embedding 只是把你输入的 "他有什么好处" 转换成向量去向量数据库查询，所以查出来的根本就不是你想要的文档内容
-        // 这时 LLM 就不会根据文档去生成你想要的内容了
+        // 场景：第一次问"java 要学什么框架"，模型回答"springboot"；
+        // 第二次问"他有什么好处"——人知道"他"指 springboot，但 embedding 不知道，
+        // 直接拿"他有什么好处"转向量检索，查出来的内容驴唇不对马嘴。
+        // 重写服务用历史上下文把指代补全后再检索。
         String searchQuery = queryRewriteService.rewrite(question, history, 5);
         if (!searchQuery.equals(question)) {
             log.info("Search query rewritten: \"{}\" → \"{}\"", question, searchQuery);
@@ -75,32 +83,49 @@ public class RagQueryService {
         // 走带缓存的服务：同一个问题问第二遍时不会重复消耗 Embedding 额度
         Embedding questionEmbedding = cachedEmbeddingService.embed(searchQuery);
 
-        // 查向量库：20 条候选 → 阈值过滤 → Rerank 精选 5 条
-        // 整段检索结果带缓存（只缓存"检索到的片段"，不缓存最终答案）
-        // 注意这里是通过注入的 Bean 调用，跨过 Spring 代理边界，@Cacheable 才会生效
-        List<RetrievedChunk> relevant = retrievalService.retrieve(searchQuery, questionEmbedding);
+        // 查向量库：20 条候选（仅本人+系统文档）→ 阈值过滤 → Rerank 精选 5 条
+        // 注意：通过注入的 Bean 调用，跨过 Spring 代理边界，@Cacheable 才会生效
+        List<RetrievedChunk> relevant = retrievalService.retrieve(userId, searchQuery, questionEmbedding);
 
-        // 自定义 prompt 模板，如果检索结果为空，则使用普通对话模式
+        // 检索完成 → 先把引用来源（含分数）推给前端，再开始生成。
+        // 用户在等待生成的同时就能看到"模型即将依据哪些资料"，回答可追溯。
+        if (onRetrieved != null) {
+            try {
+                onRetrieved.accept(relevant);
+            } catch (Exception e) {
+                log.warn("推送 sources 事件失败（不影响生成）: {}", e.getMessage());
+            }
+        }
+
+        // 自定义 prompt 模板
         String prompt;
         if (relevant.isEmpty()) {
             log.info("No relevant docs found, using normal chat mode");
-            prompt = "你是一个智能助手。请回答用户的问题。\n\n"
+            prompt = "你是一个智能助手。请回答用户的问题。"
+                    + "如果你不确定或缺乏依据，请明确说明，不要编造。\n\n"
                     + "## 问题\n" + question;
         } else {
             String context = relevant.stream()
                     .map(RetrievedChunk::getText)
                     .collect(Collectors.joining("\n\n---\n\n"));
 
+            String sources = relevant.stream()
+                    .map(c -> String.format("%s（相似度 %.2f）", c.getFileName(), c.getScore()))
+                    .collect(Collectors.joining("；"));
+
             prompt = "## 角色\n"
-                    + "你是一个基于内部文档的数据分析助手。\n\n"
+                    + "你是一个基于内部文档的学习助手。\n\n"
                     + "## 参考文档\n"
                     + context + "\n\n"
+                    + "## 本次命中的资料\n"
+                    + sources + "\n\n"
                     + "## 约束\n"
                     + "- 回答时请标注信息来源，格式：根据 [来源:文件名] 的记载/显示...\n"
                     + "- 严格基于参考文档回答，不要使用你自己的知识\n"
                     + "- 如果参考文档中没有相关信息：\n"
                     + "  - 完全不相关：回复\"根据文档内容，没有找到相关信息\"\n"
                     + "  - 部分相关：说明文档中涉及了什么，明确指出未涉及的部分\n"
+                    + "- 宁可回答\"资料不足\"，也不要编造文档里没有的内容\n"
                     + "- 回答时引用具体的行/数据来支撑你的结论\n"
                     + "- 用中文回答\n\n"
                     + "## 问题\n" + question;
@@ -122,8 +147,8 @@ public class RagQueryService {
                     log.info("Token 用量 - 输入: {}, 输出: {}, 总和: {}",
                             usage.inputTokenCount(), usage.outputTokenCount(), usage.totalTokenCount());
                 }
-                // 储存上下文
-                conversationStore.addTurn(sessionId, question, fullAnswer.toString());
+                // 储存上下文（按用户隔离）
+                conversationStore.addTurn(userId, sessionId, question, fullAnswer.toString());
                 callback.onComplete(response);
             }
 

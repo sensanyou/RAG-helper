@@ -98,6 +98,7 @@
 **作为后端学习的教材**——它把后端开发中最常见的几件事都覆盖了一遍，且每件都用可读的方式实现：
 
 - 分层架构（Controller / Service / Mapper）
+- 用户认证与多租户数据隔离（PBKDF2 + Token + owner_id 全链路）
 - 第三方 API 调用与超时处理（Embedding、Rerank、LLM）
 - 数据库事务与跨存储一致性（MySQL + 向量库）
 - 分布式锁（Redisson）
@@ -109,7 +110,7 @@
 - 统一异常处理与参数校验
 - 单元测试
 
-代码规模控制在 **30 余个 Java 文件 / 约 2800 行**，故意没有拆微服务、没有引入 MQ——为的是"一个人能在一个月内读完全部代码"。
+代码规模控制在 **47 个 Java 文件 / 约 4200 行**，故意没有拆微服务、没有引入 MQ——为的是"一个人能在一个月内读完全部代码"。
 
 ---
 
@@ -119,10 +120,16 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
+│  用户体系                                                    │
+│  ├─ 注册 / 登录 / 登出              PBKDF2 密码哈希         │
+│  ├─ Token 会话（Redis，72h 滑动续期）                        │
+│  └─ 多用户数据隔离                  文档/会话/检索全链路     │
+├─────────────────────────────────────────────────────────────┤
 │  知识入库                                                    │
 │  ├─ 网页上传（拖拽 / 点击选择）      支持 12 种格式           │
-│  ├─ 目录扫描（data/docs/）           启动时自动导入          │
-│  ├─ 内容去重（SHA-256）              重复上传自动跳过        │
+│  ├─ 同步 / 异步两种上传              异步带任务状态可轮询    │
+│  ├─ 目录扫描（data/docs/）           手动触发导入            │
+│  ├─ 内容去重（SHA-256）              按 (用户, 内容哈希) 判重 │
 │  └─ 文档删除                         向量 + 元数据同步清理    │
 ├─────────────────────────────────────────────────────────────┤
 │  智能问答                                                    │
@@ -132,17 +139,20 @@
 │  ├─ 相关性阈值过滤                   低于 0.77 直接丢弃      │
 │  ├─ 重排序（Rerank）                 向量召回 20 → 精选 5    │
 │  ├─ 答案带出处                       标注 [来源:xxx.pdf]     │
+│  ├─ 来源可追溯                       SSE sources 事件返回    │
+│  │                                   召回片段与真实分数       │
 │  └─ 无命中兜底                       转普通聊天，不硬编资料   │
 ├─────────────────────────────────────────────────────────────┤
 │  工程保障                                                    │
-│  ├─ 分布式限流（IP 令牌桶 + 每日总量）                       │
+│  ├─ 分布式限流（用户+IP 令牌桶 + 每日总量）                  │
 │  ├─ 分布式锁（防并发重复入库）                               │
+│  ├─ 三级缓存（Redis，含穿透/击穿/空值处理与降级）            │
 │  ├─ 统一响应格式 + 全局异常处理                              │
 │  ├─ 参数校验（Bean Validation）                              │
-│  └─ 三种向量库可切换（InMemory / Chroma / Milvus）           │
+│  └─ Milvus 向量库（etcd + 本地存储，持久化）                 │
 ├─────────────────────────────────────────────────────────────┤
 │  前端界面（单文件 index.html，无框架、无构建）                │
-│  深色 / 亮色主题 · 移动端适配 · 会话历史 · 消息复制           │
+│  登录页 · 深色/亮色主题 · 移动端适配 · 会话历史 · 消息复制    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -252,7 +262,7 @@ data:[DONE]
 
 ### ④ 多轮对话与查询改写
 
-会话存在 Redis（`session:{sessionId}` → JSON 数组），TTL 1 小时。存在 Redis 而不是内存，是为了多实例部署时任意一台机器都能接住同一个会话。
+会话存在 Redis（`session:{userId}:{sessionId}` → JSON 数组，按用户隔离），TTL 1 小时。存在 Redis 而不是内存，是为了多实例部署时任意一台机器都能接住同一个会话。
 
 **查询改写**是 RAG 里容易被忽略但很关键的一环：
 
@@ -275,18 +285,52 @@ data:[DONE]
 
 > **依赖已本地化**：Markdown 解析库 `marked` 放在 `static/vendor/marked.min.js`，不走外网 CDN。外网不可达时还有纯文本降级渲染，不会白屏。
 
+### ⑥ 多用户体系与数据隔离
+
+项目从"单机自用"升级为"多用户各自独立的知识库"，核心原则是：**owner_id 贯穿全链路，任何一条数据从生到死都带着主人**。
+
+```text
+注册 → PBKDF2 哈希密码（加盐 10 万次迭代）→ users 表
+登录 → 校验哈希 → 生成随机 token → Redis 会话（72h，每次请求滑动续期）
+之后每个请求 → AuthInterceptor 校验 token → UserContext(ThreadLocal) 注入当前用户
+```
+
+隔离发生在**四个层面**，缺一个都会串数据：
+
+| 层面 | 机制 |
+|------|------|
+| MySQL | documents 表带 `owner_id`，唯一键是 `(owner_id, content_hash)`——同一份文件不同用户可以各传一份 |
+| 向量库 | 每个向量写入时打上 `owner_id` metadata，检索时用 metadata filter 只召回自己的 |
+| 缓存 | 缓存 Key 里编入 userId，A 的检索结果永远不会被 B 命中 |
+| 会话 | 对话历史 Key 是 `session:{userId}:{sessionId}` |
+
+**为什么用 metadata filter 而不是按用户分 collection？** 单 collection + filter 是 Milvus 官方推荐的多租户方案：一个 collection 的索引与加载成本固定，用户多了之后"每人一个 collection"会让元数据和资源开销线性膨胀。
+
+限流的维度也从"按 IP"升级为"按用户 + IP"——登录用户按 token 计数，未登录的按 IP 计数。
+
+### ⑦ 异步上传与任务化
+
+大文件入库可能几十秒，同步接口会让请求一直挂着。异步接口把这件事变成**任务**：
+
+```
+POST /api/documents/upload-async  →  立即返回 taskId（PENDING）
+GET  /api/documents/task/{taskId} →  PENDING → PROCESSING → COMPLETED / FAILED
+```
+
+任务状态**双写**：Redis（`ingest:task:{taskId}`，前端轮询用，2h 过期）+ MySQL `ingest_tasks` 表（持久记录，支持失败重试 `POST /api/documents/task/{taskId}/retry`）。失败的任务带着 `errorMessage`，重试不用重新传文件。
+
 ## 2.3 能力边界
 
 诚实说明项目**没有**做什么，避免误解：
 
 | 维度 | 现状 |
 |------|------|
-| 用户体系 | **无登录、无鉴权**，所有数据共享。单机自用可以，多用户需自行加 Spring Security + 数据隔离 |
+| 用户体系 | **有**。注册/登录/token 会话，文档、会话、检索结果按用户隔离；但没有角色权限（所有用户平等） |
 | 文档增量更新 | 同内容重复上传会跳过；**内容变了会当成新文档**，不会替换旧的（需先删再传） |
 | 扫描件 PDF | 不支持 OCR，图片型 PDF 提取不到文字 |
-| 并发能力 | 无消息队列、无线程池、无异步任务，所有处理都是请求内同步完成 |
+| 并发能力 | 双线程池 + 并行 Embedding + 异步任务已有；**没有消息队列**，应用重启时正在处理中的任务会中断（Redis 里残留 PROCESSING 状态，可用重试接口恢复） |
 | 大文件 | 上限 50MB（`spring.servlet.multipart`），超大文件解析会长时间占用请求线程 |
-| 向量库 | 默认 `in-memory`，**重启后向量全部丢失**（MySQL 里的文档记录还在，但检索不到），需重新上传或用 Chroma/Milvus |
+| 向量库 | Milvus（etcd + 本地存储），**重启数据不丢**；但要求 Docker 环境常驻 |
 
 ---
 
@@ -301,14 +345,19 @@ data:[DONE]
 └───────────────────────┬──────────────────────────────────────┘
                         │ POST /api/chat {sessionId, question}
                         ▼
+┌───────────────────────┬──────────────────────────────────────┐
+│        AuthInterceptor（注册/登录接口除外）                   │
+│        Authorization: Bearer → Redis 会话 → UserContext       │
+└───────────────────────┬──────────────────────────────────────┘
+                        ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                    RateLimitAspect (@RateLimit)               │
-│        Redisson 令牌桶（IP + 全局每日）                        │
+│        Redisson 令牌桶（用户 + IP + 全局每日）                 │
 │        429 → 统一 Results 格式返回                             │
 └───────────────────────┬──────────────────────────────────────┘
                         ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                      ChatController                           │
+│              ChatController / DocumentController              │
 │            SseEmitter (60s timeout) · Jackson 序列化          │
 └───────────────────────┬──────────────────────────────────────┘
                         ▼
@@ -317,13 +366,13 @@ data:[DONE]
 │                                                               │
 │  ┌──────────────┐   ┌───────────────┐   ┌─────────────────┐  │
 │  │  会话历史      │──▶│  Query        │──▶│  Embedding      │  │
-│  │  Redis        │   │  Rewriting    │   │  BGE-large-zh   │  │
-│  └──────────────┘   └───────────────┘   └───────┬─────────┘  │
-│                                                  ▼            │
+│  │  session:     │   │  Rewriting    │   │  BGE-large-zh   │  │
+│  │  {uid}:{sid}  │   └───────────────┘   └───────┬─────────┘  │
+│  └──────────────┘                                ▼            │
 │                                           ┌────────────┐     │
-│                                           │ Vector      │     │
-│                                           │ Store       │     │
+│                                           │ Milvus      │     │
 │                                           │ top 20      │     │
+│                                           │ owner 过滤  │     │
 │                                           └─────┬──────┘     │
 │                                                  ▼            │
 │  ┌──────────────┐   ┌───────────────┐   ┌─────────────────┐  │
@@ -335,18 +384,19 @@ data:[DONE]
 │  ┌───────────────────────────────────────────────────────┐    │
 │  │ 文档来源                                               │   │
 │  │  ├─ Web 上传（Multipart, SHA256 去重）                 │   │
-│  │  └─ 目录扫描（data/docs/ 自动扫描）                    │   │
+│  │  └─ 目录扫描（data/docs/ 手动触发）                    │   │
 │  └───────────────┬───────────────────────────────────────┘    │
 │                  │ 元数据                                     │
 │                  ▼                                            │
 │  ┌──────────────────────────────────────────────────────┐    │
 │  │              MySQL + MyBatis-Plus                     │    │
-│  │  documents（文档元数据） · document_chunks（分块映射） │    │
+│  │  users（账号）· documents（owner_id 隔离）             │    │
+│  │  document_chunks（分块映射）· ingest_tasks（任务）     │    │
 │  └──────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────┘
 
                          ┌────────────┐
-                         │   Redis    │ ← 多实例共享会话 + 分布式限流 + 分布式锁
+                         │   Redis    │ ← 登录会话 + 缓存 + 限流 + 锁 + 任务状态
                          └────────────┘
 ```
 
@@ -354,28 +404,29 @@ data:[DONE]
 
 | 存储 | 存什么 | 为什么是它 |
 |------|--------|-----------|
-| **向量库** | 文本块 + 向量 | 唯一能做"语义相似度检索"的地方 |
-| **MySQL** | 文档元数据、分块→向量ID 映射 | 需要事务、需要能按条件查 |
-| **Redis** | 会话历史、限流计数、分布式锁 | 需要过期时间、需要多实例共享 |
+| **向量库** | 文本块 + 向量（带 owner_id metadata） | 唯一能做"语义相似度检索"的地方 |
+| **MySQL** | 用户、文档元数据、分块→向量ID 映射、任务记录 | 需要事务、需要能按条件查 |
+| **Redis** | 登录会话、三级缓存、限流计数、分布式锁、任务状态 | 需要过期时间、需要多实例共享 |
 
 ## 3.2 技术栈
 
 | 分类 | 技术选型 | 版本 | 为什么选它 |
 |------|---------|------|-----------|
-| 语言 / 运行时 | Java | 8 | 兼容性最好，绝大多数企业后端仍在用 |
+| 语言 / 运行时 | Java | 8 语法 / JDK 17 运行 | 兼容性最好，绝大多数企业后端仍在用 |
 | 框架 | Spring Boot | 2.7.18 | 2.x 最后一个维护版本，也是支持 JDK 8 的最后一代 |
 | AI 编排 | LangChain4j | 0.35.0 | 最后支持 JDK 8 的版本系列 |
 | 对话模型 | OpenAI 兼容 API | — | 默认 DeepSeek；可换 GPT / GLM / 通义，只改配置 |
 | Embedding | BAAI/bge-large-zh-v1.5 | 1024 维 | 中文效果好的开源模型，硅基流动免费额度可用 |
 | Rerank | BAAI/bge-reranker-v2-m3 | — | 交叉编码器重排，与 Embedding 同一服务商 |
-| 向量库 | InMemory / Chroma 0.4.24 / Milvus 2.3.x | — | 三档可选，按规模切换，只改一行配置 |
+| 向量库 | Milvus | 2.4.15 | 生产级向量数据库，metadata filter 做多租户隔离 |
+| 认证 | PBKDF2 + Token 会话 | — | 密码加盐哈希存储，token 存 Redis 支持吊销与续期 |
 | 元数据库 | MySQL + MyBatis-Plus | 8.0 / 3.5.2 | 事务 + 条件查询，业务数据标准配置 |
-| 缓存 | Redis + Redisson | 7 / 4.5.0 | 会话、限流、分布式锁共用一套客户端 |
+| 缓存 | Redis + Redisson | 7 / 4.5.0 | 会话、缓存、限流、分布式锁共用一套客户端 |
 | 文档解析 | POI 5.5.1 / PDFBox / JSoup | — | Office / PDF / HTML 三件套 |
 | HTTP 客户端 | OkHttp | 4.12.0 | Rerank 与 SSE 调用，支持细粒度超时 |
 | 参数校验 | Spring Boot Validation | — | `@Valid` + `@NotBlank` 声明式校验 |
-| 构建 | Maven + Docker 多阶段 | — | 见 `Dockerfile`（构建用 maven:3.8-temurin-8，运行用 temurin:8） |
-| 测试 | JUnit 5 + Mockito + MockWebServer | — | 6 个测试类，13 个用例 |
+| 构建 | Maven + Docker 多阶段 | — | 见 `Dockerfile` |
+| 测试 | JUnit 5 + Mockito + MockWebServer | — | 10 个测试类，29 个用例 |
 
 ## 3.3 五条关键设计
 
@@ -384,7 +435,7 @@ data:[DONE]
 ### ① 分布式锁：同一个文件不许并发入库
 
 ```java
-RLock lock = redissonClient.getLock("lock:document:ingest:" + contentHash);
+RLock lock = redissonClient.getLock("lock:document:ingest:" + ownerId + ":" + contentHash);
 if (!lock.tryLock(0, 60, TimeUnit.SECONDS)) {
     return existingDocument;   // 别的线程正在处理同一个文件，直接跳过
 }
@@ -397,16 +448,16 @@ try {
 
 **两个细节**：
 
-- 锁的 key 用**内容哈希**而不是文件名。两个用户同时传同一份资料，会被同一把锁串行化。
+- 锁的 key 用**用户 ID + 内容哈希**而不是文件名。同一用户重复提交同一份资料会被同一把锁串行化；不同用户互不影响。
 - 拿到锁后必须**再查一次数据库**。因为可能在你等锁的这段时间里，前一个请求已经把它入库了——这叫 double-check。
 
 锁的粒度分三级，互不干扰：
 
 | 锁 Key | 场景 | 目的 |
 |--------|------|------|
-| `lock:document:ingest:{hash}` | 入库 | 防同一文件并发处理 |
+| `lock:document:ingest:{ownerId}:{hash}` | 入库 | 防同一用户同一文件并发处理 |
 | `lock:document:delete:{id}` | 删除 | 防删除与入库交叉 |
-| `session:lock:{sessionId}` | 会话 | 防同一会话并发写坏历史 |
+| `session:lock:{userId}:{sessionId}` | 会话 | 防同一会话并发写坏历史 |
 
 ### ② 两级限流：控制成本而不是控制性能
 
@@ -537,7 +588,7 @@ for (int[] range : ranges) {
 ```
 POST /api/documents/upload-async  →  立即返回 taskId（PENDING）
                                     ↓ ingestExecutor 后台处理
-GET  /api/documents/task/{taskId} →  PENDING → RUNNING → SUCCESS / FAILED
+GET  /api/documents/task/{taskId} →  PENDING → PROCESSING → COMPLETED / FAILED
 ```
 
 任务状态存 Redis（`ingest:task:{taskId}`，2 小时过期），所以**多实例部署时任一节点都能查到进度**。实测 6 个文件并发提交，全部在 200ms 内返回，后台 7~37ms 完成入库。
@@ -554,15 +605,15 @@ GET  /api/documents/task/{taskId} →  PENDING → RUNNING → SUCCESS / FAILED
 rag-study-helper/
 ├── src/                              # 源码
 ├── docs/                             # SQL 迁移脚本
-│   └── remove-feishu.sql             #   历史迁移脚本
-├── data/docs/                        # 文档扫描目录（启动时自动导入）
-├── logs/                             # 运行日志
-├── init.sql                          # MySQL 建表脚本
-├── Dockerfile                        # 多阶段构建（Maven → Temurin 8）
-├── docker-compose.yml                # Docker 部署：MySQL + Redis + Milvus + app
-├── Dockerfile                        # 应用镜像构建（多阶段：Maven 构建 → JDK 运行）
+│   ├── remove-feishu.sql             #   历史迁移脚本
+│   └── migration-v2.sql              #   多用户改造迁移（users/owner_id/ingest_tasks）
+├── data/docs/                        # 文档扫描目录
+├── logs/                             # 运行日志（不进版本库）
+├── init.sql                          # MySQL 建表脚本（已含多用户表结构）
+├── Dockerfile                        # 应用镜像构建（多阶段）
+├── docker-compose.yml                # Docker 部署：etcd + Milvus + MySQL + Redis + app
 ├── .env.example                      # 环境变量模板
-├── start.bat                         # Windows 一键启动脚本
+├── start.bat                         # Windows 一键启动脚本（内置密钥与端口）
 ├── pom.xml
 └── README.md
 ```
@@ -573,36 +624,55 @@ rag-study-helper/
 src/main/java/com/rag/studyhelper/
 │
 ├── controller/                    ← 接入层：只做参数接收与结果返回
+│   ├── AuthController.java             注册/登录/登出（/api/auth/**）
 │   ├── ChatController.java             SSE 流式问答（POST /api/chat）
-│   └── DocumentController.java         文档增删查（/api/documents/**）
+│   └── DocumentController.java         文档增删查 + 异步任务（/api/documents/**）
+│
+├── context/
+│   └── UserContext.java                ThreadLocal 保存当前登录用户
 │
 ├── service/                       ← 业务层：真正的逻辑都在这里
-│   ├── RagQueryService.java            RAG 主流程编排（11 步）
-│   ├── DocumentIngestionService.java   解析→切分→向量化→双写→补偿（12 步，最复杂）
+│   ├── RagQueryService.java            RAG 主流程编排
+│   ├── RetrievalService.java           向量检索（独立 Bean，保证缓存注解生效）
+│   ├── CachedEmbeddingService.java     Embedding + 缓存 + 并行批处理
+│   ├── DocumentIngestionService.java   解析→切分→向量化→双写→补偿（最复杂）
+│   ├── AsyncIngestService.java         异步任务（Redis + MySQL 双写状态、重试）
+│   ├── AuthService.java                注册/登录/登出编排
+│   ├── PasswordService.java            PBKDF2 密码哈希
+│   ├── TokenService.java               token 生成/校验/续期/批量吊销
 │   ├── DocumentMetadataService.java    MySQL 事务边界
 │   ├── QueryRewriteService.java        多轮查询改写
 │   ├── RerankService.java              调用 Rerank API 重排序
 │   ├── RateLimitService.java           令牌桶 + 每日计数
-│   ├── ConversationStore.java          会话存储接口
+│   ├── ConversationStore.java          会话存储接口（带 userId）
 │   └── RedisConversationStore.java     会话存储 Redis 实现
 │
 ├── config/                        ← 配置层：Bean 装配与横切关注点
-│   ├── LangChain4jConfig.java          Chat/Embedding/VectorStore 三个 Bean
+│   ├── LangChain4jConfig.java          Chat/Embedding/Milvus Bean
+│   ├── AuthInterceptor.java            登录校验（除注册/登录外全拦截）
+│   ├── WebMvcConfig.java               拦截器注册
+│   ├── AsyncConfig.java                双线程池（ingest / rag）
+│   ├── CacheConfig.java                Redis 三缓存区 + 降级
+│   ├── CacheKeyGenerator.java          缓存 Key 生成（含 userId）
 │   ├── RedissonConfig.java             Redisson 客户端
 │   ├── MyBatisPlusConfig.java          分页插件
 │   ├── MyMetaObjectHandler.java        create_time/update_time 自动填充
 │   ├── GlobalExceptionHandler.java     全局异常处理
-│   ├── RateLimit.java                  @RateLimit 注解
-│   ├── IpRateLimit.java                @IpRateLimit 注解
+│   ├── RateLimit.java / IpRateLimit.java 限流注解
 │   └── RateLimitAspect.java            限流切面（AOP 环绕通知）
 │
 ├── mapper/                        ← 持久层：MyBatis-Plus BaseMapper
+│   ├── UserMapper.java
 │   ├── DocumentsMapper.java
-│   └── DocumentChunksMapper.java
+│   ├── DocumentChunksMapper.java
+│   └── IngestTaskRecordMapper.java
 │
 ├── model/                         ← 数据模型
-│   ├── Documents.java                  documents 实体
+│   ├── User.java                       users 实体
+│   ├── Documents.java                  documents 实体（含 ownerId）
 │   ├── DocumentChunks.java             document_chunks 实体
+│   ├── IngestTaskRecord.java           ingest_tasks 实体
+│   ├── IngestTask.java                 任务状态 DTO（前端轮询用）
 │   ├── DocumentInfo.java               返回给前端的 DTO
 │   ├── ChatRequest.java                问答请求体（带 @NotBlank 校验）
 │   └── ChatMessage.java                role + content
@@ -618,7 +688,8 @@ src/main/java/com/rag/studyhelper/
 src/main/resources/
 ├── application.yml                     唯一配置文件
 └── static/
-    ├── index.html                      前端单页（约 1800 行）
+    ├── index.html                      前端单页（问答 + 知识库面板）
+    ├── login.html                      登录/注册页
     └── vendor/marked.min.js            Markdown 解析库（本地化，不走 CDN）
 ```
 
@@ -698,27 +769,12 @@ app:
 
 ## 5.3 向量库配置
 
-三种模式靠一行配置切换，`LangChain4jConfig` 里用 `@ConditionalOnProperty` 做条件装配——**同一时刻只会创建其中一个 Bean**：
+向量库固定为 **Milvus**（生产级、持久化、支持 metadata filter 多租户隔离）：
 
 ```yaml
 vector:
   store:
-    type: in-memory      # 可选：in-memory | chroma | milvus
-```
-
-| 模式 | 适用场景 | 数据持久性 | 额外部署 |
-|------|---------|-----------|---------|
-| `in-memory` | 开发调试、演示 | ❌ 重启即丢 | 无 |
-| `chroma` | 个人/中型使用 | ✅ 持久化 | 需启动 Chroma 服务 |
-| `milvus` | 大数据量、生产 | ✅ 持久化 + 分布式 | 需 etcd + MinIO + Milvus |
-
-对应的连接参数：
-
-```yaml
-chroma:
-  host: localhost
-  port: 8000
-  collection-name: rag_study_helper
+    type: milvus
 
 milvus:
   host: localhost
@@ -727,7 +783,37 @@ milvus:
   dimension: 1024          # 必须与 Embedding 模型维度一致！
 ```
 
-> Chroma 服务端必须用 **0.4.24**。0.6.x 起 API 有破坏性变更，langchain4j 0.35 调不通。
+### Milvus 部署形态（重要）
+
+`docker-compose.yml` 里 Milvus 部分是 **etcd 容器 + 本地存储**，没有 MinIO：
+
+| 组件 | 镜像 | 作用 |
+|------|------|------|
+| milvus | milvusdb/milvus:v2.4.15 | 向量数据库（standalone 模式） |
+| etcd | quay.io/coreos/etcd:v3.5.5 | 元数据存储 |
+
+```yaml
+# docker-compose.yml 中的关键配置
+milvus:
+  environment:
+    ETCD_ENDPOINTS: etcd:2379
+    COMMON_STORAGETYPE: local    # 对象数据落本地盘，不需要 MinIO
+```
+
+**为什么不用官方默认的 etcd + MinIO 三件套？**
+
+1. **MinIO 镜像在国内已无法拉取**——`minio/minio` 在 Docker Hub 国内加速器上全部报 `not found`（官方从镜像站下架），quay.io 也没有公开镜像。
+2. 单机部署用不上 MinIO 的分布式能力，`COMMON_STORAGETYPE=local` 让 Milvus 把对象数据直接落本地盘，备份时拷数据卷即可。
+3. **不要用内嵌 etcd 模式**（`ETCD_USE_EMBED=true`）——在 Docker Desktop / WSL2 环境下启动即 SIGSEGV panic（v2.3.3 与 v2.4.15 均复现），独立 etcd 容器没有这个问题。
+
+启动方式：
+
+```bash
+docker compose up -d etcd milvus     # 只启动向量库（本机已有 MySQL/Redis 时）
+docker compose up -d                 # 全套（含 app/mysql/redis 容器）
+```
+
+> Milvus 就绪约 30~60 秒，健康检查：`curl http://localhost:9091/healthz` 返回 `OK` 即可。
 
 ## 5.4 数据源与限流
 
@@ -757,6 +843,9 @@ app:
     ip-supplement-seconds: 60     # 每 60 秒补满
     ip-expire-hours: 24           # Redis Key 过期时间
     daily-max: 10000              # 全局每日上限
+
+  auth:
+    token-ttl-hours: 72           # 登录会话有效期（小时），每次请求滑动续期
 
   # 线程池与并行度（高并发相关）
   async:
@@ -804,6 +893,7 @@ cp .env.example .env
 | `APP_RAG_RERANK_API_KEY` | | 复用 Embedding | Rerank 密钥 |
 | `SPRING_DATASOURCE_URL` | | `localhost:3306/rag_study_helper` | MySQL 连接串 |
 | `SPRING_DATASOURCE_PASSWORD` | ✅ | `123456` | MySQL 密码 |
+| `APP_AUTH_TOKEN_TTL_HOURS` | | `72` | 登录会话有效期（小时） |
 | `SPRING_REDIS_HOST` | | `localhost` | Redis 地址 |
 | `SPRING_REDIS_PASSWORD` | | 空 | Redis 密码 |
 | `SERVER_PORT` | | `8083` | 服务端口 |
@@ -823,11 +913,13 @@ cp .env.example .env
 |------|---------|---------|
 | JDK | 8 或以上（推荐 8 / 11 / 17） | `java -version` |
 | Maven | 3.6+ | `mvn -v` |
+| Docker Desktop | 任意近期版本（跑 Milvus 用） | `docker ps` |
 | MySQL | 8.0+ | `mysql --version` |
 | Redis | 5.0+（Windows 可用 msys2 版） | `redis-cli ping` |
 | API Key | 对话模型 1 个 + Embedding 模型 1 个 | — |
 
-> Redis 是必须的，哪怕只做单机试用——会话、限流、分布式锁都依赖它，**不是可选项**。
+> Redis 是必须的，哪怕只做单机试用——登录会话、缓存、限流、分布式锁都依赖它，**不是可选项**。
+> Milvus 必须依赖 Docker 运行（官方不提供 Windows 原生版），首次启动需拉取约 1GB 镜像。
 
 ## 6.2 方式一：本地运行（推荐新手）
 
@@ -840,14 +932,27 @@ mysql -u root -p
 # 建库
 CREATE DATABASE IF NOT EXISTS rag_study_helper DEFAULT CHARSET utf8mb4;
 
-# 导入表结构（退出 mysql 后在项目根目录执行）
+# 导入表结构（init.sql 已包含 users / owner_id / ingest_tasks 多用户结构）
 mysql -u root -p rag_study_helper < init.sql
 
-# 验证：应该看到 documents 和 document_chunks 两张表
+# 已有旧库的，执行增量迁移
+mysql -u root -p rag_study_helper < docs/migration-v2.sql
+
+# 验证：应该看到 users、documents、document_chunks、ingest_tasks 四张表
 mysql -u root -p rag_study_helper -e "SHOW TABLES;"
 ```
 
-### 第 2 步：启动 Redis
+### 第 2 步：启动 Milvus（Docker）
+
+```bash
+# 在项目根目录执行（只启动向量库，不动本机 MySQL/Redis）
+docker compose up -d etcd milvus
+
+# 等 30~60 秒，验证健康
+curl http://localhost:9091/healthz    # 返回 OK 即正常
+```
+
+### 第 3 步：启动 Redis
 
 ```bash
 # Linux / macOS
@@ -860,7 +965,7 @@ redis-server.exe redis.conf
 redis-cli ping     # 返回 PONG 即正常
 ```
 
-### 第 3 步：配置密钥
+### 第 4 步：配置密钥
 
 **三选一**：
 
@@ -891,7 +996,7 @@ export SPRING_DATASOURCE_PASSWORD="你的MySQL密码"
 
 `Run → Edit Configurations → Environment variables`，把上面几个变量填进去。
 
-### 第 4 步：启动
+### 第 5 步：启动
 
 ```bash
 # 方式 A：直接跑
@@ -911,9 +1016,9 @@ Started RagStudyHelperApplication in 7.584 seconds
 Tomcat started on port(s): 8083 (http)
 ```
 
-### 第 5 步：打开界面
+### 第 6 步：打开界面
 
-浏览器访问 **http://localhost:8083**
+浏览器访问 **http://localhost:8083**，会先进入登录页——注册一个账号即可开始使用。
 
 ## 6.3 方式二：Docker Compose
 
@@ -924,14 +1029,14 @@ Tomcat started on port(s): 8083 (http)
 cp .env.example .env
 # 编辑 .env，填入两个 API Key 和 MySQL 密码
 
-# 2. 启动（Milvus 生产级方案）
+# 2. 启动全套（app + mysql + redis + etcd + milvus）
 docker compose up -d
 
 # 3. 看日志
 docker compose logs -f app
 
 # 4. 等待就绪
-docker compose ps        # milvus 就绪约需 1-2 分钟
+docker compose ps        # milvus 就绪约需 1 分钟
 
 # 5. 访问 http://localhost:8080（注意：Docker 内映射的是 8080）
 ```
@@ -939,18 +1044,17 @@ docker compose ps        # milvus 就绪约需 1-2 分钟
 | 服务 | 镜像 | 作用 |
 |------|------|------|
 | app | 本地构建 | Spring Boot 应用 |
-| mysql | mysql:8.0 | 文档元数据，首次启动自动执行 `init.sql` |
-| redis | redis:7-alpine | 会话 + 限流 + 锁 |
-| milvus | milvusdb/milvus:v2.3.3 | 向量库（持久化） |
+| mysql | mysql:8.0 | 用户 + 元数据 + 任务记录，首次启动自动执行 `init.sql` |
+| redis | redis:7-alpine | 会话 + 缓存 + 限流 + 锁 |
+| milvus | milvusdb/milvus:v2.4.15 | 向量库（持久化，本地存储模式） |
 | etcd | quay.io/coreos/etcd:v3.5.5 | Milvus 元数据存储 |
-| minio | minio/minio | Milvus 对象存储 |
 
-> Milvus 还依赖 etcd 和 MinIO，首次启动要等 1–2 分钟。用 `docker compose ps` 检查健康状态。
+> 没有配置 MinIO：单机部署用 `COMMON_STORAGETYPE=local` 本地存储即可，且 MinIO 镜像国内已无法拉取。
 > `.env` 里的 `SPRING_DATASOURCE_URL` 主机名是 `mysql`（容器内网），与本地的 `localhost` 不同，别混用。
 
 ## 6.4 验证是否成功
 
-按顺序验证，每一步都过了才算真的跑通：
+按顺序验证，每一步都过了才算真的跑通。**除注册/登录外所有接口都要带 `Authorization: Bearer <token>` 头**。
 
 **① 首页能打开**
 
@@ -959,14 +1063,23 @@ curl -o /dev/null -w "%{http_code}\n" http://localhost:8083/
 # 期望：200
 ```
 
-**② 文档列表接口正常**
+**② 未登录访问被拦截**
 
 ```bash
 curl http://localhost:8083/api/documents
-# 期望：{"resCode":"200","msg":"成功","obj":[]}
+# 期望：{"resCode":"401","msg":"未登录或会话已过期","obj":null}
 ```
 
-**③ 上传一个文件能入库**
+**③ 注册并拿到 token**
+
+```bash
+curl -X POST http://localhost:8083/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"testuser","password":"test123456"}'
+# 期望：{"resCode":"200","msg":"注册成功","obj":{"token":"..."}}
+```
+
+**④ 带token 上传一个文件能入库**
 
 ```bash
 # 先准备一个测试文件
@@ -974,31 +1087,38 @@ echo "# 测试文档
 
 Spring Boot 的核心特性包括自动配置、起步依赖、内嵌容器、Actuator 监控。" > test.md
 
-curl -X POST http://localhost:8083/api/documents/upload -F "file=@test.md"
+TOKEN="上一步返回的token"
+curl -X POST http://localhost:8083/api/documents/upload \
+  -H "Authorization: Bearer $TOKEN" -F "file=@test.md"
 # 期望：{"resCode":"200","msg":"成功","obj":{"id":1,"documentName":"test.md","chunks":1}}
 ```
 
-或者在浏览器知识库面板里拖一个 PDF 进去。
+或者在浏览器登录后，在知识库面板里拖一个 PDF 进去。
 
-**④ 参数校验生效**
+**⑤ 参数校验生效**
 
 ```bash
 curl -X POST http://localhost:8083/api/chat \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"sessionId":"t1","question":""}'
 # 期望：HTTP 400，{"resCode":"400","msg":"question: question 不能为空"}
 ```
 
-**⑤ 完整问答链路（最关键）**
+**⑥ 完整问答链路（最关键）**
 
 ```bash
 curl -N -X POST http://localhost:8083/api/chat \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"sessionId":"t1","question":"Spring Boot 有哪些核心特性"}'
 ```
 
-期望看到逐 token 推流，并且回答里**引用了刚上传的文档**：
+期望看到 `sources` 事件（召回片段与真实分数），随后逐 token 推流：
 
 ```
+event:sources
+data:{"sources":[{"score":0.85,"fileName":"test.md"}]}
+
 data:{"token":"根据"}
 data:{"token":" ["}
 data:{"token":"来源"}
@@ -1006,13 +1126,26 @@ data:{"token":"来源"}
 data:[DONE]
 ```
 
-如果回答里出现了 `[来源:test.md]`，说明**整条链路都通了**：解析 → 切分 → Embedding → 向量检索 → 阈值过滤 → Rerank → LLM 生成 → SSE 推送。
+如果 `sources` 里有刚上传的文件名，说明**整条链路都通了**：鉴权 → owner 过滤 → Embedding → 向量检索 → 阈值过滤 → Rerank → LLM 生成 → SSE 推送。
 
-**⑥ Redis 有数据了**
+**⑦ 多用户隔离生效**
+
+再注册一个账号查询文档列表，应该看不到 testuser 的文档：
+
+```bash
+curl -X POST http://localhost:8083/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"other","password":"test123456"}'
+# 用第二个 token 查列表
+curl http://localhost:8083/api/documents -H "Authorization: Bearer <token2>"
+# 期望：{"resCode":"200","msg":"成功","obj":[]}   ← 空，看不到别人的文档
+```
+
+**⑧ Redis 有数据了**
 
 ```bash
 redis-cli --scan
-# 期望看到：session:t1、rl:daily:chat:2026-xx-xx、rl:ip:chat:... 等
+# 期望看到：login:token:xxx、session:{userId}:t1、rl:daily:chat:2026-xx-xx 等
 ```
 
 ## 6.5 常见问题
@@ -1039,14 +1172,29 @@ lsof -i :8083
 
 要么杀掉占用进程，要么改 `server.port`。
 
+### ❌ 启动报 `Unable to connect to Redis ... 6379`
+
+Redis 没起来（它不是 Windows 服务，不会自启）。先 `redis-cli ping`，不通就启动它。
+
+### ❌ 启动报 `EmbeddingStore` 相关 Bean 缺失或 Milvus 连接失败
+
+Milvus 没启动或还没就绪。检查顺序：
+
+```bash
+docker ps                              # rag-milvus、rag-milvus-etcd 是否 Up
+curl http://localhost:9091/healthz     # 是否返回 OK
+netstat -ano | findstr :19530          # 端口是否监听
+```
+
 ### ❌ 上传成功但问答说"没有找到相关资料"
 
 **可能原因，按概率排序**：
 
-1. **向量库是 `in-memory`，重启过**——向量丢了。MySQL 里还有文档记录，但检索不到。解决：重新上传，或改用 Chroma/Milvus。
-2. **阈值 0.77 太高**——把你的问题换个说法再问；或临时调低 `score-threshold` 到 `0.6` 试试。
-3. **Embedding Key 无效**——检查日志有没有 `401` 或 `Embedding failed`。
-4. **文档内容太少**——切分后每块太短，语义信息不足。
+1. **Milvus 没启动**——检索直接失败。按上一条排查。
+2. **阈值 0.77 太高**——把你的问题换个说法（尽量贴近文档原文）再问；或临时调低 `score-threshold` 到 `0.6` 试试。短文档、口语化提问的相似度天然偏低。
+3. **文档是别的账号上传的**——检索按用户隔离，登录的账号不对就查不到。
+4. **Embedding Key 无效**——检查日志有没有 `401` 或 `Embedding failed`。
+5. **文档内容太少**——切分后每块太短，语义信息不足。
 
 ### ❌ 网页能打开，但上传文件提示失败
 
@@ -1066,13 +1214,15 @@ lsof -i :8083
 向量维度和空间都变了。必须清空向量库重新入库：
 
 ```bash
-# Milvus：删数据卷
-docker compose down -v
-
-# InMemory：重启应用即可（本来就不持久化）
+docker compose down -v     # 删除 Milvus 数据卷（etcd + milvus 数据一起清）
+docker compose up -d etcd milvus
 ```
 
 同时确认 `milvus.dimension` 与新模型维度一致（bge-large-zh 是 1024，OpenAI text-embedding-3-small 是 1536）。
+
+### ❌ 升级到多用户版本后，旧文档"消失"了
+
+多用户改造要求每个文档都有 `owner_id`，历史数据的 `owner_id` 为 NULL，不属于任何用户（包括你自己的账号）。**登录后重新上传即可**，内容哈希不同的新记录会正常入库。
 
 ---
 
@@ -1090,43 +1240,58 @@ docker compose down -v
 |---------|------|
 | `200` | 成功 |
 | `400` | 参数错误 |
+| `401` | 未登录或会话已过期 |
+| `403` | 无权访问该资源（如操作别人的文档） |
 | `404` | 资源不存在 |
 | `413` | 文件过大 |
 | `429` | 请求过于频繁（限流） |
 | `500` | 服务器内部错误 |
 
+> **鉴权**：除 `/api/auth/register`、`/api/auth/login` 外，所有接口都要带请求头 `Authorization: Bearer <token>`（或 `X-Auth-Token: <token>`）。token 在注册/登录响应的 `obj.token` 里，有效期 72 小时，每次请求自动续期。
+
 ### 接口列表
 
 | 接口 | 方法 | 请求 | 返回 | 说明 |
 |------|------|------|------|------|
+| `/api/auth/register` | POST | `{"username","password"}` | `Results<LoginResponse>` | 注册并直接返回 token |
+| `/api/auth/login` | POST | `{"username","password"}` | `Results<LoginResponse>` | 登录返回 token |
+| `/api/auth/logout` | POST | — | `Results<Void>` | 吊销当前 token |
 | `/api/chat` | POST | `{"sessionId","question"}` | SSE | 流式问答，错误走 `event:error` |
 | `/api/documents/upload` | POST | `multipart/form-data` | `Results<DocumentInfo>` | 同步上传，阻塞到入库完成（限流 10 次/分钟） |
 | `/api/documents/upload-async` | POST | `multipart/form-data` | `Results<IngestTask>` | **异步**上传，立即返回 `taskId`（限流 60 次/分钟） |
 | `/api/documents/task/{taskId}` | GET | — | `Results<IngestTask>` | 查询异步任务状态，404 表示不存在或已过期 |
-| `/api/documents` | GET | — | `Results<List<DocumentInfo>>` | 已入库文档列表（10 分钟缓存） |
-| `/api/documents/scan` | POST | — | `Results<List<DocumentInfo>>` | 扫描 `data/docs/` |
-| `/api/documents/{id}` | DELETE | — | `Results<Void>` | 删除文档及向量（同时清缓存） |
+| `/api/documents/tasks` | GET | — | `Results<List<IngestTask>>` | 当前用户的历史任务列表 |
+| `/api/documents/task/{taskId}/retry` | POST | — | `Results<Void>` | 重试失败的任务 |
+| `/api/documents` | GET | — | `Results<List<DocumentInfo>>` | **当前用户**的文档列表（10 分钟缓存） |
+| `/api/documents/scan` | POST | — | `Results<List<DocumentInfo>>` | 扫描 `data/docs/`（按当前用户入库） |
+| `/api/documents/{id}` | DELETE | — | `Results<Void>` | 删除文档及向量（校验归属，同时清缓存） |
 
 **两个上传接口怎么选？**
 
 - 小文件（几 MB）、想立刻拿到结果 → `/upload`
 - 大文件（几十 MB 的 PDF）、不想让请求挂几十秒 → `/upload-async` + 轮询
 
-异步任务的 `status` 流转：`PENDING → RUNNING → SUCCESS / FAILED`，`finished` 字段可直接用于判断是否停止轮询：
+异步任务的 `status` 流转：`PENDING → PROCESSING → COMPLETED / FAILED`，`finished` 字段可直接用于判断是否停止轮询：
 
 ```bash
+TOKEN="你的token"
 # 提交
-curl -X POST -F "file=@big.pdf" http://localhost:8083/api/documents/upload-async
+curl -X POST -H "Authorization: Bearer $TOKEN" -F "file=@big.pdf" \
+  http://localhost:8083/api/documents/upload-async
 # {"obj":{"taskId":"a20a8f5f...","status":"PENDING","finished":false}}
 
 # 轮询（建议 1~2 秒一次）
-curl http://localhost:8083/api/documents/task/a20a8f5f...
-# {"obj":{"status":"SUCCESS","chunks":30,"costMillis":8,"finished":true}}
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8083/api/documents/task/a20a8f5f...
+# {"obj":{"status":"COMPLETED","chunks":30,"costMillis":8,"finished":true}}
 ```
 
 ### SSE 协议
 
 ```text
+# 来源事件（推送召回片段与真实分数，可追溯）
+event:sources
+data:{"sources":[{"score":0.85,"fileName":"test.md"}]}
+
 # 正常
 data:{"token":"逐"}
 data:{"token":"步"}
@@ -1152,7 +1317,11 @@ mvn test
 | `QueryRewriteServiceTest` | 3 | 查询改写触发条件 |
 | `RateLimitServiceTest` | 3 | 令牌桶与每日限流 |
 | `RedisConversationStoreTest` | 1 | 会话序列化与并发写入 |
-| **合计** | **13** | |
+| `PasswordServiceTest` | 5 | PBKDF2 哈希、加盐、校验、错误密码拒绝 |
+| `UserContextTest` | 3 | ThreadLocal 用户上下文绑定与清理 |
+| `IngestTaskJsonTest` | 4 | 任务状态序列化与派生字段 |
+| `CacheKeyGeneratorTest` | 4 | 缓存 Key 生成（含 userId 维度） |
+| **合计** | **29** | |
 
 ## C. JDK 8 版本锁定说明
 
@@ -1160,11 +1329,10 @@ mvn test
 
 | 组件 | 版本 | 原因 |
 |------|------|------|
-| Java | 8 | 起点约束 |
+| Java | 8 语法 | 起点约束（本机用 JDK 17 运行，语法保持 8） |
 | Spring Boot | 2.7.18 | 2.x 最后维护版 |
 | LangChain4j | 0.35.0 | **0.36.0 起要求 JDK 17** |
-| Chroma | 0.4.24 | 0.6.x+ API 不兼容 langchain4j 0.35 |
-| Milvus | 2.3.x | 与 langchain4j 0.35 匹配 |
+| Milvus | 2.4.15 | 与 langchain4j 0.35 匹配；不要用内嵌 etcd 模式（WSL2 下崩溃） |
 | redisson-spring-data | 27 | Redisson 4.5.0 默认带 `spring-data-40`，与 Boot 2.7 不兼容，已在 `pom.xml` 里排除并显式引入 27 |
 | snakeyaml | 2.2 | 覆盖 Boot 默认版本，修复中文注释 YAML 解析时的 `ArrayIndexOutOfBoundsException` |
 

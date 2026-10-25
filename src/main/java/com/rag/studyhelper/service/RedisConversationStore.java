@@ -16,7 +16,13 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 会话存储服务
+ * 会话存储服务（Redis 实现，按用户隔离）。
+ * <p>
+ * <b>V2 隔离改造</b>：key 从 {@code session:{sessionId}} 改为
+ * {@code session:{userId}:{sessionId}}。锁的粒度同步调整——
+ * 两个用户用相同 sessionId 也不会互锁。
+ * key 的拼接规则收敛在 {@link #key(long, String)} 一个私有方法里，
+ * 调用方不允许自行拼 key，防止绕过隔离。
  */
 @Service
 public class RedisConversationStore implements ConversationStore {
@@ -38,19 +44,24 @@ public class RedisConversationStore implements ConversationStore {
         this.objectMapper = new ObjectMapper();
     }
 
+    /** key 规则统一在这里，调用方不允许自行拼 key（防止绕过隔离） */
+    private static String key(long userId, String sessionId) {
+        return KEY_PREFIX + userId + ":" + sessionId;
+    }
+
     /**
      * 获取上下文
      */
     @Override
-    public List<ChatMessage> getHistory(String sessionId) {
-        String json = redisTemplate.opsForValue().get(KEY_PREFIX + sessionId);
+    public List<ChatMessage> getHistory(long userId, String sessionId) {
+        String json = redisTemplate.opsForValue().get(key(userId, sessionId));
         if (json == null) {
             return Collections.emptyList();
         }
         try {
             return objectMapper.readValue(json, new TypeReference<List<ChatMessage>>() {});
         } catch (Exception e) {
-            log.warn("Failed to deserialize history for session {}", sessionId, e);
+            log.warn("Failed to deserialize history for user={} session={}", userId, sessionId, e);
             return Collections.emptyList();
         }
     }
@@ -59,11 +70,11 @@ public class RedisConversationStore implements ConversationStore {
      * 添加轮次
      */
     @Override
-    public void addTurn(String sessionId, String userMessage, String assistantMessage) {
-        RLock lock = redissonClient.getLock(KEY_PREFIX + "lock:" + sessionId);
+    public void addTurn(long userId, String sessionId, String userMessage, String assistantMessage) {
+        RLock lock = redissonClient.getLock(key(userId, sessionId) + ":lock");
         lock.lock();
         try {
-            List<ChatMessage> history = new ArrayList<>(getHistory(sessionId));
+            List<ChatMessage> history = new ArrayList<>(getHistory(userId, sessionId));
             history.add(new ChatMessage("user", userMessage));
             history.add(new ChatMessage("assistant", assistantMessage));
 
@@ -73,9 +84,9 @@ public class RedisConversationStore implements ConversationStore {
             }
 
             String json = objectMapper.writeValueAsString(history);
-            redisTemplate.opsForValue().set(KEY_PREFIX + sessionId, json, TTL_HOURS, TimeUnit.HOURS);
+            redisTemplate.opsForValue().set(key(userId, sessionId), json, TTL_HOURS, TimeUnit.HOURS);
         } catch (Exception e) {
-            log.error("Failed to save history for session {}", sessionId, e);
+            log.error("Failed to save history for user={} session={}", userId, sessionId, e);
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
@@ -87,11 +98,11 @@ public class RedisConversationStore implements ConversationStore {
      * 清空上下文历史
      */
     @Override
-    public void clear(String sessionId) {
-        RLock lock = redissonClient.getLock(KEY_PREFIX + "lock:" + sessionId);
+    public void clear(long userId, String sessionId) {
+        RLock lock = redissonClient.getLock(key(userId, sessionId) + ":lock");
         lock.lock();
         try {
-            redisTemplate.delete(KEY_PREFIX + sessionId);
+            redisTemplate.delete(key(userId, sessionId));
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();

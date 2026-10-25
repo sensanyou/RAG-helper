@@ -75,14 +75,6 @@
             <version>${langchain4j.version}</version>
         </dependency>
 
-        <!-- Chroma vector store (alternative to Milvus, for medium projects) -->
-        <dependency>
-            <groupId>dev.langchain4j</groupId>
-            <artifactId>langchain4j-chroma</artifactId>
-            <version>${langchain4j.version}</version>
-            <optional>true</optional>
-        </dependency>
-
         <!-- Apache POI: Excel (.xlsx) / Word (.docx) / PowerPoint (.pptx) -->
         <dependency>
             <groupId>org.apache.poi</groupId>

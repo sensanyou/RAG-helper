@@ -9,6 +9,19 @@ set SPRING_DATASOURCE_PASSWORD=SSC163425
 set APP_RAG_CHAT_API_KEY=sk-1789f5fef3b5407d966043fec5ce62b5
 set APP_RAG_EMBEDDING_API_KEY=sk-rnqlwrpejjzgnteltynbzsibilsvwtsuoogfcuepppbuyrbz
 
+rem ===== 定位 java：优先用本机固定安装的 JDK 17，找不到再退回 PATH =====
+set JAVA_EXE=java
+if exist "C:\Program Files\Java\jdk-17.0.19\bin\java.exe" (
+    set "JAVA_EXE=C:\Program Files\Java\jdk-17.0.19\bin\java.exe"
+) else (
+    where java >nul 2>nul
+    if errorlevel 1 (
+        echo [错误] 找不到 java。请安装 JDK 17 或修改本脚本中的 JAVA_EXE 路径。
+        pause >nul
+        exit /b 1
+    )
+)
+
 echo ============================================
 echo  RAG Study Helper
 echo  MySQL   : localhost:3306 / rag_study_helper
@@ -17,7 +30,7 @@ echo  Web     : http://localhost:8083
 echo ============================================
 echo.
 
-java -jar target\rag-study-helper-0.0.1-SNAPSHOT.jar
+"%JAVA_EXE%" -jar target\rag-study-helper-0.0.1-SNAPSHOT.jar
 
 echo.
 echo ============================================

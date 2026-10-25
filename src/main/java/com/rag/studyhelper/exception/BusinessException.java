@@ -27,6 +27,20 @@ public class BusinessException extends RuntimeException {
         return new BusinessException(HttpStatus.BAD_REQUEST, "400", message);
     }
 
+    /** 401：未登录或凭证失效。区别于 403（登录了但没权限） */
+    public static BusinessException unauthorized(String message) {
+        return new BusinessException(HttpStatus.UNAUTHORIZED, "401", message);
+    }
+
+    /** 403：已登录，但资源不属于你。绝不泄露资源是否存在——统一说"无权访问" */
+    public static BusinessException forbidden(String message) {
+        return new BusinessException(HttpStatus.FORBIDDEN, "403", message);
+    }
+
+    public static BusinessException internal(String message) {
+        return new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "500", message);
+    }
+
     public static BusinessException notFound(String message) {
         return new BusinessException(HttpStatus.NOT_FOUND, "404", message);
     }

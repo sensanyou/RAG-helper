@@ -2,7 +2,9 @@ package com.rag.studyhelper.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rag.studyhelper.config.IpRateLimit;
+import com.rag.studyhelper.context.UserContext;
 import com.rag.studyhelper.model.ChatRequest;
+import com.rag.studyhelper.model.RetrievedChunk;
 import com.rag.studyhelper.service.RagQueryService;
 import com.rag.studyhelper.utils.Results;
 import dev.langchain4j.data.message.AiMessage;
@@ -19,12 +21,25 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import javax.validation.Valid;
 
 /**
- * 聊天接口
+ * 聊天接口（V2：按用户隔离会话与检索 + 引用来源可追溯）。
+ * <p>
+ * <b>SSE 事件协议（四个通道）：</b>
+ * <ul>
+ *   <li>默认事件：{@code {"token":"..."}} —— 生成的增量文本；</li>
+ *   <li>{@code sources}：检索完成时推一次，
+ *       {@code {"sources":[{"fileName","score"}...]}} —— 本次回答依据的资料；
+ *       先于第一个 token 到达，用户在等待生成时就能看到引用；</li>
+ *   <li>{@code error}：出错时推错误信息；</li>
+ *   <li>{@code [DONE]}：结束哨兵。</li>
+ * </ul>
+ * <b>userId 从 UserContext 取</b>，会话历史与检索结果都按它隔离。
  */
 @RestController
 @RequestMapping("/api")
@@ -36,30 +51,19 @@ public class ChatController {
     @Autowired
     private RagQueryService ragQueryService;
 
-    /**
-     * 整条链路逻辑
-     * 前端浏览器                    Java 后端                    LangChain OpenAI  API
-     * │                           │                            │
-     * │── POST /api/chat ────────→│                            │
-     * │                           │── HTTP streaming request ──→│
-     * │                           │                            │
-     * │   ← SSE: {"token":"你"}   │◄── "你" (onNext) ────────── │
-     * │   ← SSE: {"token":"好"}   │◄── "好" (onNext) ────────── │
-     * │   ← SSE: [DONE]           │◄── complete ─────────────── │
-     * <br/>
-     * 关于请求中断：LangChain4j 0.35.0 未暴露 HTTP 连接句柄，无法主动取消 LLM 调用
-     * 升级到 LangChain4j 1.0+（需 JDK 17）后可做到真正的请求级取消
-     * 为了方便后续升级，我没有做手动的 Java 后端与 LLM 的请求中断交互
-     * 只是让前端和java后端SSE断开连接
-     */
+
     @IpRateLimit("chat")
     @PostMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter chat(@Valid @RequestBody ChatRequest request) {
+        long userId = UserContext.requireUserId();
         // 与前端交互的 SSE 响应
         SseEmitter emitter = new SseEmitter(60_000L);
 
         try {
-            ragQueryService.streamAnswer(request.getSessionId(), request.getQuestion(), new StreamingResponseHandler<AiMessage>() {
+            ragQueryService.streamAnswer(userId, request.getSessionId(), request.getQuestion(),
+                    // 检索完成回调：把引用来源（文件名 + 相似度分数）先推给前端
+                    relevant -> sendSources(emitter, relevant),
+                    new StreamingResponseHandler<AiMessage>() {
                 // 处理 LLM 返回的分词结果
                 @Override
                 public void onNext(String token) {
@@ -117,5 +121,32 @@ public class ChatController {
         }
 
         return emitter;
+    }
+
+    /**
+     * 推送引用来源事件。
+     * <p>
+     * 只发"文件名 + 分数"的摘要，不把片段全文再发一遍——
+     * 全文已经在回答里被模型引用了，重复推送浪费带宽。
+     */
+    private void sendSources(SseEmitter emitter, List<RetrievedChunk> relevant) {
+        try {
+            List<Map<String, Object>> sources = new ArrayList<>();
+            if (relevant != null) {
+                for (RetrievedChunk c : relevant) {
+                    Map<String, Object> s = new HashMap<>();
+                    s.put("fileName", c.getFileName());
+                    s.put("score", Math.round(c.getScore() * 1000) / 1000.0);
+                    sources.add(s);
+                }
+            }
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("sources", sources);
+            emitter.send(SseEmitter.event()
+                    .name("sources")
+                    .data(OBJECT_MAPPER.writeValueAsString(payload)));
+        } catch (Exception e) {
+            log.warn("发送 sources 事件失败: {}", e.getMessage());
+        }
     }
 }

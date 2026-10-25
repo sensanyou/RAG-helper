@@ -62,13 +62,6 @@ public class DocumentIngestionService {
 
     private static final Logger log = LoggerFactory.getLogger(DocumentIngestionService.class);
 
-    /**
-     * 缓存"向量库里是否有数据"的探测结果。
-     * <p>
-     * 用 {@link java.util.concurrent.atomic.AtomicReference} 而不是 boolean，
-     * 是为了区分三态：{@code null}=还没探测过、{@code true}=有数据、{@code false}=确认空。
-     * 这样"确认为空"的情况下次会重新探测（因为上传成功后就会变成非空）。
-     */
     private final java.util.concurrent.atomic.AtomicReference<Boolean> vectorStoreState =
             new java.util.concurrent.atomic.AtomicReference<>();
 
@@ -113,10 +106,10 @@ public class DocumentIngestionService {
         this.cacheManager = cacheManager;
     }
 
-    // 初始化用于跑本地文档
+    // 初始化用于跑本地文档（系统文档，ownerId=0，对所有用户可见）
     @PostConstruct
     public void init() {
-        scanAndIngest();
+        scanAndIngest(0L);
     }
 
     /**
@@ -137,10 +130,12 @@ public class DocumentIngestionService {
     }
 
     /**
-     * 扫描目录下所有文件，并解析入库
+     * 扫描目录下所有文件，并解析入库。
+     *
+     * @param ownerId 文档归属用户；0=系统文档（启动扫描），登录用户调用 scan 接口时传其 userId
      */
-    public List<DocumentInfo> scanAndIngest() {
-        log.info("Scanning document directory: {}", scanPath);
+    public List<DocumentInfo> scanAndIngest(long ownerId) {
+        log.info("Scanning document directory: {} (ownerId={})", scanPath, ownerId);
         List<DocumentInfo> results = new ArrayList<>();
         File dir = new File(scanPath);
         if (!dir.exists()) {
@@ -164,7 +159,7 @@ public class DocumentIngestionService {
         }
         for (File file : files) {
             try {
-                DocumentInfo info = ingestDocument(file.toPath());
+                DocumentInfo info = ingestDocument(ownerId, file.toPath());
                 results.add(info);
             } catch (Exception e) {
                 log.error("Failed to ingest document: {}", file.getName(), e);
@@ -177,29 +172,31 @@ public class DocumentIngestionService {
     /**
      * 通过文件路径直接解析文档入库
      */
-    public DocumentInfo ingestDocument(Path filePath) throws IOException {
+    public DocumentInfo ingestDocument(long ownerId, Path filePath) throws IOException {
         String fileName = filePath.getFileName().toString();
         try (InputStream inputStream = new FileInputStream(filePath.toFile())) {
-            return ingestDocument(fileName, inputStream, "SCAN");
+            return ingestDocument(ownerId, fileName, inputStream, "SCAN");
         }
     }
 
     /**
      * 通过输入流直接解析文档入库
      */
-    public DocumentInfo ingestDocument(String fileName, InputStream inputStream) throws IOException {
-        return ingestDocument(fileName, inputStream, "UPLOAD");
+    public DocumentInfo ingestDocument(long ownerId, String fileName, InputStream inputStream) throws IOException {
+        return ingestDocument(ownerId, fileName, inputStream, "UPLOAD");
     }
 
-    private DocumentInfo ingestDocument(String fileName, InputStream inputStream, String source) throws IOException {
+    private DocumentInfo ingestDocument(long ownerId, String fileName, InputStream inputStream,
+                                        String source) throws IOException {
         byte[] content = IOUtils.toByteArray(inputStream);
         if (content.length == 0) {
             throw BusinessException.badRequest("文件内容为空");
         }
         String hash = sha256(content);
-        log.info("Ingesting document: {}, hash={}", fileName, hash);
+        log.info("Ingesting document: ownerId={}, hash={}", ownerId, hash);
 
-        RLock lock = redissonClient.getLock("lock:document:ingest:" + hash);
+        // 锁粒度 = owner + 内容哈希：不同用户上传同一文件互不阻塞，各自拥有独立副本
+        RLock lock = redissonClient.getLock("lock:document:ingest:" + ownerId + ":" + hash);
         boolean locked = false;
         try {
             locked = lock.tryLock(10, TimeUnit.SECONDS);
@@ -208,11 +205,17 @@ public class DocumentIngestionService {
             }
 
             // 锁内再次检查，避免并发上传时重复向量化和重复插入。
+            // 去重维度是 (owner_id, content_hash)：同一用户重复上传返回已有记录；
+            // 不同用户上传相同文件，各自拥有自己的副本——全局唯一 hash 会导致
+            // "B 上传 A 已有的文件 → 拿到 A 的文档"，属于跨用户数据泄露。
             Documents existing = documentsMapper.selectOne(
-                    Wrappers.<Documents>lambdaQuery().eq(Documents::getContentHash, hash)
+                    Wrappers.<Documents>lambdaQuery()
+                            .eq(Documents::getOwnerId, ownerId)
+                            .eq(Documents::getContentHash, hash)
             );
             if (existing != null && vectorStoreHasData()) {
-                log.info("Document already ingested: {} (hash={})", existing.getDocumentName(), hash);
+                log.info("Document already ingested: {} (ownerId={}, hash={})",
+                        existing.getDocumentName(), ownerId, hash);
                 return new DocumentInfo(existing.getId(), existing.getDocumentName(), existing.getChunkCount());
             }
             if (existing != null) {
@@ -226,7 +229,7 @@ public class DocumentIngestionService {
             }
 
             Document document = parseDocument(fileName, new ByteArrayInputStream(content));
-            return processAndSave(document, fileName, source, hash, (long) content.length,
+            return processAndSave(ownerId, document, fileName, source, hash, (long) content.length,
                     "UPLOAD".equals(source) ? "upload" : "scan");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -315,7 +318,7 @@ public class DocumentIngestionService {
     /**
      * 入库主流程
      */
-    private DocumentInfo processAndSave(Document document, String fileName, String source,
+    private DocumentInfo processAndSave(long ownerId, Document document, String fileName, String source,
                                         String contentHash, Long fileSize,
                                         String creator) throws IOException {
         Tokenizer tokenizer = new OpenAiTokenizer();
@@ -343,15 +346,15 @@ public class DocumentIngestionService {
             throw BusinessException.badRequest("文档没有可入库的文本内容");
         }
 
+        // <b>把 ownerId 写进每个片段的 metadata（V2 数据隔离的关键）。</b>
+        // Metadata 不参与 Embedding 计算，不消耗模型 token；
+        // 检索时 RetrievalService 用它做 filter，只召回当前用户可见的片段。
+        // 权限过滤必须发生在"召回阶段"，而不是召回后在 Java 里过滤——
+        // 后者 top20 可能全是别人的，过滤完剩 0 条，且别人的内容已进入请求路径。
         segments.replaceAll(textSegment -> TextSegment.from(
-                prefix + textSegment.text()));
-
-//        todo 权限 rag 新增 仅 chroma 和 milvus 使用 如果是 私有文档，使用 .put("document_id", docRecord.getId())))
-//        Metadata 的内容不会被送入 Embedding 模型，因此不消耗模型的 token 额度。
-//        segments.replaceAll(textSegment -> TextSegment.from(
-//                "[来源:" + fileName + "]\n" + textSegment.text(),
-//                new Metadata()
-//                        .put("visibility", "public")));
+                prefix + textSegment.text(),
+                new dev.langchain4j.data.document.Metadata()
+                        .put("userId", String.valueOf(ownerId))));
 
         // ── 并行 Embedding ──────────────────────────────────────────────
         // 原来是一批一批串行等 HTTP 响应：34 个分块 = 4 批 = 4 个 RTT 相加。
@@ -477,6 +480,7 @@ public class DocumentIngestionService {
 
         // 文档入库
         Documents docRecord = new Documents();
+        docRecord.setOwnerId(ownerId);
         docRecord.setDocumentName(fileName);
         docRecord.setDocumentType(docType);
         docRecord.setSource(source);
@@ -663,11 +667,12 @@ public class DocumentIngestionService {
      * <p>
      * {@code sync = true} 的意义见 {@link #getIngestedDocumentsSync()}。
      */
-    @Cacheable(cacheNames = CacheConfig.CACHE_DOCUMENTS, key = "'all'")
-    public List<DocumentInfo> getIngestedDocuments() {
+    @Cacheable(cacheNames = CacheConfig.CACHE_DOCUMENTS, key = "'u' + #ownerId")
+    public List<DocumentInfo> getIngestedDocuments(long ownerId) {
         List<Documents> docs = documentsMapper.selectList(
                 Wrappers.<Documents>lambdaQuery()
                         .select(Documents::getId, Documents::getDocumentName, Documents::getChunkCount)
+                        .eq(Documents::getOwnerId, ownerId)
                         .orderByDesc(Documents::getCreateTime)
         );
         List<DocumentInfo> result = new ArrayList<>();
@@ -693,11 +698,12 @@ public class DocumentIngestionService {
      * 注解会被完全忽略——这是 Spring AOP 最常见的坑（self-invocation）。
      * 所以下面的查询逻辑虽然重复，但必须独立写一遍。
      */
-    @Cacheable(cacheNames = CacheConfig.CACHE_DOCUMENTS, key = "'all'", sync = true)
-    public List<DocumentInfo> getIngestedDocumentsSync() {
+    @Cacheable(cacheNames = CacheConfig.CACHE_DOCUMENTS, key = "'u' + #ownerId", sync = true)
+    public List<DocumentInfo> getIngestedDocumentsSync(long ownerId) {
         List<Documents> docs = documentsMapper.selectList(
                 Wrappers.<Documents>lambdaQuery()
                         .select(Documents::getId, Documents::getDocumentName, Documents::getChunkCount)
+                        .eq(Documents::getOwnerId, ownerId)
                         .orderByDesc(Documents::getCreateTime)
         );
         List<DocumentInfo> result = new ArrayList<>();
@@ -722,10 +728,18 @@ public class DocumentIngestionService {
      * 全清代价远低于维护"哪个 key 对应哪个文档"的映射关系复杂度。
      */
     @CacheEvict(cacheNames = {CacheConfig.CACHE_DOCUMENTS, CacheConfig.CACHE_RETRIEVAL}, allEntries = true)
-    public void deleteDocument(Long documentId) {
+    public void deleteDocument(long ownerId, Long documentId) {
         Documents document = documentsMapper.selectById(documentId);
         if (document == null) {
             throw new NoSuchElementException("文档不存在: " + documentId);
+        }
+        // <b>归属校验在一切操作之前</b>——先确认"这份文档是你的"，
+        // 再谈删除。不校验的话，任何登录用户都能删别人的文档。
+        // 系统文档（ownerId=0）只有系统进程能管理，普通用户删除一律 403。
+        if (document.getOwnerId() == null || document.getOwnerId() != ownerId) {
+            log.warn("越权删除被拒绝: userId={} 尝试删除 ownerId={} 的文档 {}",
+                    ownerId, document.getOwnerId(), documentId);
+            throw BusinessException.forbidden("无权删除该文档");
         }
 
         RLock lock = redissonClient.getLock("lock:document:delete:" + documentId);

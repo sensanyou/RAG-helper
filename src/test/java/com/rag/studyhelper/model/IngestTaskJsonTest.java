@@ -78,7 +78,7 @@ class IngestTaskJsonTest {
      */
     @Test
     void unknownFieldShouldBeIgnored() throws Exception {
-        String jsonWithExtra = "{\"taskId\":\"t4\",\"fileName\":\"d.md\",\"status\":\"SUCCESS\","
+        String jsonWithExtra = "{\"taskId\":\"t4\",\"fileName\":\"d.md\",\"status\":\"COMPLETED\","
                 + "\"chunks\":2,\"finished\":true,\"someFutureField\":\"whatever\"}";
 
         IngestTask task = objectMapper().readValue(jsonWithExtra, IngestTask.class);

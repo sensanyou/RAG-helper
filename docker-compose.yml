@@ -1,20 +1,16 @@
-version: "3.8"
-
-# Milvus 向量数据库（Standalone 模式）— 生产级部署方案
+# Milvus 向量数据库（Standalone）— 生产级部署方案
 #
-# 容器拓扑：app + mysql + redis + milvus + etcd + minio
-# Milvus 依赖 etcd（元数据存储）和 MinIO（对象持久化）。
-# 首次启动会下载镜像，milvus 就绪约需 1-2 分钟。
+# 架构：独立 etcd 容器（元数据）+ Milvus 本地存储（对象数据，无需 MinIO）。
+# 说明：MinIO 官方已从国内镜像站下架镜像无法拉取，故单机部署采用
+# COMMON_STORAGETYPE=local 让 Milvus 把对象数据落到本地盘。
 #
 # 使用方式：
 #   1. 创建 .env 文件（参考下方示例）或直接设置环境变量
-#   2. 构建并启动:  docker compose up -d
-#   3. 查看日志:    docker compose logs -f
-#   4. 等待就绪:    docker compose ps
-#                  等待 milvus 状态变为 healthy
-#   5. 访问:       http://localhost:8080
-#   6. 停止:       docker compose down
-#   7. 清理数据:   docker compose down -v
+#   2. 启动 Milvus:  docker compose up -d milvus
+#   3. 等待就绪:     docker compose ps  （milvus 状态 Up，日志无报错，约 30-60 秒）
+#   4. 全套启动:     docker compose up -d
+#   5. 停止:         docker compose down
+#   6. 清理数据:     docker compose down -v
 #
 # .env 文件示例：
 #   APP_RAG_CHAT_API_KEY=sk-deepseek-xxx
@@ -36,38 +32,20 @@ services:
         --listen-client-urls http://0.0.0.0:2379
         --advertise-client-urls http://0.0.0.0:2379
 
-  minio:
-    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
-    container_name: rag-milvus-minio
-    ports:
-      - "9001:9001"
-    volumes:
-      - minio-data:/minio_data
-    environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-    command: minio server /minio_data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
   milvus:
-    image: milvusdb/milvus:v2.3.3
+    image: milvusdb/milvus:v2.4.15
     container_name: rag-milvus
     command: milvus run standalone
-    ports:
-      - "19530:19530"   # gRPC
-      - "9091:9091"     # HTTP
-    volumes:
-      - milvus-data:/var/lib/milvus
     environment:
       ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio:9000
+      COMMON_STORAGETYPE: local                               # 对象数据落本地盘（MinIO 已从国内镜像站下架，本地存储即可满足单机部署）
+    volumes:
+      - milvus-data:/var/lib/milvus
+    ports:
+      - "19530:19530"   # gRPC（应用连接端口）
+      - "9091:9091"     # HTTP 健康检查
     depends_on:
       - etcd
-      - minio
     restart: unless-stopped
 
   mysql:
@@ -138,6 +116,5 @@ services:
 
 volumes:
   etcd-data:
-  minio-data:
   milvus-data:
   mysql-data:

@@ -26,7 +26,7 @@ public class IngestTask {
     /** 文件名 */
     private String fileName;
 
-    /** 状态：PENDING / RUNNING / SUCCESS / FAILED */
+    /** 状态：PENDING / PROCESSING / COMPLETED / FAILED */
     private String status;
 
     /** 成功后返回的文档 ID */
@@ -63,7 +63,7 @@ public class IngestTask {
         return new IngestTask()
                 .setTaskId(taskId)
                 .setFileName(fileName)
-                .setStatus("SUCCESS")
+                .setStatus("COMPLETED")
                 .setDocumentId(documentId)
                 .setChunks(chunks)
                 .setDuplicated(duplicated)
@@ -106,6 +106,6 @@ public class IngestTask {
      */
     @JsonProperty(access = JsonProperty.Access.READ_ONLY)
     public boolean isFinished() {
-        return "SUCCESS".equals(status) || "FAILED".equals(status);
+        return "COMPLETED".equals(status) || "FAILED".equals(status);
     }
 }

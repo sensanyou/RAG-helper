@@ -19,6 +19,9 @@ public class Documents {
     @TableId(type = IdType.AUTO)
     private Long id;
 
+    /** 所属用户 ID，0=系统文档（对所有用户可见）。数据隔离的核心字段 */
+    private Long ownerId;
+
     private String documentName;
 
     private String documentType;

@@ -1,6 +1,7 @@
 package com.rag.studyhelper.controller;
 
 import com.rag.studyhelper.config.RateLimit;
+import com.rag.studyhelper.context.UserContext;
 import com.rag.studyhelper.exception.BusinessException;
 import com.rag.studyhelper.model.DocumentInfo;
 import com.rag.studyhelper.model.IngestTask;
@@ -15,17 +16,19 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * 文档管理控制器。
+ * 文档管理控制器（V2：所有接口强制归属校验）。
+ * <p>
+ * <b>userId 从哪来？</b>
+ * 统一从 {@link UserContext}（ThreadLocal）取，
+ * 它由认证拦截器从 token 解出——<b>绝不接受前端传 user_id 参数</b>。
+ * 前端传什么都可以伪造，这是数据隔离的第一原则。
  * <p>
  * <b>同步上传 vs 异步上传，怎么选？</b>
  * <ul>
- *   <li>{@code POST /upload}：同步。请求线程一直等到入库完成才返回，
- *       适合小文件（几十 KB 的笔记），前端能拿到立刻的结果。</li>
- *   <li>{@code POST /upload-async}：异步。立即返回任务 ID，后台线程处理，
- *       适合大文件（PDF/PPT，几十秒）。<b>这是推荐方式</b>，
- *       因为它不会长时间占用 Tomcat 线程。</li>
+ *   <li>{@code POST /upload}：同步，适合小文件，能立刻拿到结果；</li>
+ *   <li>{@code POST /upload-async}：异步，立即返回任务 ID，<b>推荐</b>，
+ *       不占用 Tomcat 线程。</li>
  * </ul>
- * 两个接口并存是刻意的：让学习者能直接对比同一份文件走两条路的耗时差异。
  */
 @RestController
 @RequestMapping("/api/documents")
@@ -38,21 +41,19 @@ public class DocumentController {
     private AsyncIngestService asyncIngestService;
 
     /**
-     * 上传文件（同步）。
-     * <p>
-     * 注意这个方法<b>会阻塞</b>直到解析 + 向量化 + 双写全部完成。
-     * 大文件请改用 {@link #uploadAsync(MultipartFile)}。
+     * 上传文件（同步）。会阻塞直到解析 + 向量化 + 双写完成。
      */
     @RateLimit(value = "upload", maxCapacity = 10, supplementTimeOfSeconds = 60)
     @PostMapping("/upload")
     public Results<DocumentInfo> upload(@RequestParam("file") MultipartFile file) {
+        long ownerId = UserContext.requireUserId();
         String originalName = file.getOriginalFilename();
         if (file.isEmpty() || originalName == null) {
             throw BusinessException.badRequest("文件为空");
         }
 
         try {
-            DocumentInfo result = documentIngestionService.ingestDocument(originalName, file.getInputStream());
+            DocumentInfo result = documentIngestionService.ingestDocument(ownerId, originalName, file.getInputStream());
             return Results.success(result);
         } catch (IOException e) {
             throw new BusinessException(org.springframework.http.HttpStatus.BAD_REQUEST, "400",
@@ -61,38 +62,25 @@ public class DocumentController {
     }
 
     /**
-     * 上传文件（异步）。
-     * <p>
-     * 立即返回 {@code taskId}（毫秒级），真正的解析与向量化在 {@code ingestExecutor}
-     * 线程池中执行。前端拿到 taskId 后轮询 {@link #getTaskStatus(String)}。
-     * <p>
-     * <b>限流参数比同步接口宽松</b>（60 次/分钟 vs 10 次/分钟），
-     * 因为异步接口本身响应极快，不会占用资源；
-     * 真正消耗资源的入库操作已经由线程池的队列容量（200）保护住了。
-     * 这是"限流应该卡在资源消耗点，而不是卡在接口调用点"的体现。
+     * 上传文件（异步）。立即返回 taskId，前端轮询任务状态。
      */
     @RateLimit(value = "upload-async", maxCapacity = 60, supplementTimeOfSeconds = 60)
     @PostMapping("/upload-async")
     public Results<IngestTask> uploadAsync(@RequestParam("file") MultipartFile file) {
-        IngestTask task = asyncIngestService.submit(file);
+        long ownerId = UserContext.requireUserId();
+        IngestTask task = asyncIngestService.submit(ownerId, file);
         return Results.success("任务已提交，请轮询任务状态", task);
     }
 
     /**
-     * 查询异步入库任务状态。
-     * <p>
-     * 返回的 {@code status} 有四种取值：
-     * <ul>
-     *   <li>{@code PENDING}：已排队，等待线程池调度</li>
-     *   <li>{@code RUNNING}：正在解析/向量化</li>
-     *   <li>{@code SUCCESS}：完成，{@code documentId} 和 {@code chunks} 有值</li>
-     *   <li>{@code FAILED}：失败，{@code errorMessage} 说明原因</li>
-     * </ul>
+     * 查询异步入库任务状态（只能查自己提交的任务）。
      */
     @GetMapping("/task/{taskId}")
     public Results<IngestTask> getTaskStatus(@PathVariable String taskId) {
-        IngestTask task = asyncIngestService.getTask(taskId);
+        long ownerId = UserContext.requireUserId();
+        IngestTask task = asyncIngestService.getTask(ownerId, taskId);
         if (task == null) {
+            // 故意不区分"不存在"和"不是你的"——防止探测他人 taskId
             throw new BusinessException(org.springframework.http.HttpStatus.NOT_FOUND, "404",
                     "任务不存在或已过期: " + taskId, null);
         }
@@ -100,25 +88,48 @@ public class DocumentController {
     }
 
     /**
-     * 文档列表。
-     * <p>
-     * 走 {@code sync = true} 版本：并发场景下只放一个线程查库，
-     * 其余线程等结果，防止缓存过期瞬间把数据库打穿（缓存击穿防护）。
+     * 我的任务列表（最近 20 条）。
+     */
+    @GetMapping("/tasks")
+    public Results<List<IngestTask>> listMyTasks() {
+        long ownerId = UserContext.requireUserId();
+        return Results.success(asyncIngestService.listMyTasks(ownerId, 20));
+    }
+
+    /**
+     * 失败任务重试。
+     */
+    @PostMapping("/task/{taskId}/retry")
+    public Results<IngestTask> retryTask(@PathVariable String taskId) {
+        long ownerId = UserContext.requireUserId();
+        return Results.success("已复位为待处理", asyncIngestService.retry(ownerId, taskId));
+    }
+
+    /**
+     * 我的文档列表（缓存 key 按用户隔离）。
      */
     @GetMapping
     public Results<List<DocumentInfo>> listDocuments() {
-        return Results.success(documentIngestionService.getIngestedDocumentsSync());
+        long ownerId = UserContext.requireUserId();
+        return Results.success(documentIngestionService.getIngestedDocumentsSync(ownerId));
     }
 
-    // 扫描并导入文件
+    /**
+     * 扫描 data/docs 目录并导入为当前用户的文档。
+     */
     @PostMapping("/scan")
     public Results<List<DocumentInfo>> scanDocuments() {
-        return Results.success(documentIngestionService.scanAndIngest());
+        long ownerId = UserContext.requireUserId();
+        return Results.success(documentIngestionService.scanAndIngest(ownerId));
     }
 
+    /**
+     * 删除文档（校验归属：只能删自己的文档）。
+     */
     @DeleteMapping("/{id}")
     public Results<Void> deleteDocument(@PathVariable Long id) {
-        documentIngestionService.deleteDocument(id);
+        long ownerId = UserContext.requireUserId();
+        documentIngestionService.deleteDocument(ownerId, id);
         return Results.success("删除成功");
     }
 }
