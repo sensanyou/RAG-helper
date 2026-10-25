@@ -38,25 +38,7 @@ public class RedissonConfig {
             config.useSingleServer().setPassword(password);
         }
 
-        // 集群模式
-//        config.useClusterServers()
-//                .addNodeAddress("redis://<your-redis-node1-ip>:<port1>",
-//                        "redis://<your-redis-node2-ip>:<port2>",
-//                        "redis://<your-redis-node3-ip>:<port3>")
-//                // 设置密码（如果集群有密码）
-//                .setPassword(password)
-//                // 主节点连接池大小
-//                .setMasterConnectionPoolSize(4)
-//                // 主节点最小空闲连接数
-//                .setMasterConnectionMinimumIdleSize(1)
-//                // 从节点连接池配置
-//                .setSlaveConnectionPoolSize(4)
-//                // 从节点最小空闲连接数
-//                .setSlaveConnectionMinimumIdleSize(1)
-//                // 读负载均衡
-//                .setReadMode(ReadMode.SLAVE)
-//                // 集群状态扫描间隔（毫秒），用于自动发现拓扑变更
-//                .setScanInterval(2000);
+
         return Redisson.create(config);
     }
 }

@@ -53,6 +53,19 @@
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-milvus</artifactId>
             <version>${langchain4j.version}</version>
+            <exclusions>
+                <!--
+                  milvus-sdk-java 会传递引入 log4j-slf4j-impl，
+                  它是 SLF4J 的"实现"，会和 Spring Boot 自带的 logback-classic 冲突，
+                  启动时打印 "Class path contains multiple SLF4J bindings"。
+                  日志实际由 logback 负责，排掉这个桥接实现不影响任何功能。
+                  注意：只排 slf4j-impl，不要排 log4j-api —— sdk 内部可能还在用它的 API。
+                -->
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-slf4j-impl</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- Document parsing (PDF) -->

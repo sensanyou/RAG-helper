@@ -559,9 +559,8 @@ rag-study-helper/
 ├── logs/                             # 运行日志
 ├── init.sql                          # MySQL 建表脚本
 ├── Dockerfile                        # 多阶段构建（Maven → Temurin 8）
-├── docker-compose.yml                # 组合一：InMemory 向量库
-├── docker-compose-chroma.yml         # 组合二：Chroma 向量库
-├── docker-compose-milvus.yml         # 组合三：Milvus 向量库
+├── docker-compose.yml                # Docker 部署：MySQL + Redis + Milvus + app
+├── Dockerfile                        # 应用镜像构建（多阶段：Maven 构建 → JDK 运行）
 ├── .env.example                      # 环境变量模板
 ├── start.bat                         # Windows 一键启动脚本
 ├── pom.xml
@@ -925,15 +924,16 @@ Tomcat started on port(s): 8083 (http)
 cp .env.example .env
 # 编辑 .env，填入两个 API Key 和 MySQL 密码
 
-# 2. 三选一启动
-docker compose up -d                                  # InMemory（最轻）
-docker compose -f docker-compose-chroma.yml up -d     # Chroma（持久化）
-docker compose -f docker-compose-milvus.yml up -d     # Milvus（生产级）
+# 2. 启动（Milvus 生产级方案）
+docker compose up -d
 
 # 3. 看日志
 docker compose logs -f app
 
-# 4. 访问 http://localhost:8080（注意：Docker 内映射的是 8080）
+# 4. 等待就绪
+docker compose ps        # milvus 就绪约需 1-2 分钟
+
+# 5. 访问 http://localhost:8080（注意：Docker 内映射的是 8080）
 ```
 
 | 服务 | 镜像 | 作用 |
@@ -941,7 +941,9 @@ docker compose logs -f app
 | app | 本地构建 | Spring Boot 应用 |
 | mysql | mysql:8.0 | 文档元数据，首次启动自动执行 `init.sql` |
 | redis | redis:7-alpine | 会话 + 限流 + 锁 |
-| chroma / milvus | — | 向量库（按所选 compose 文件） |
+| milvus | milvusdb/milvus:v2.3.3 | 向量库（持久化） |
+| etcd | quay.io/coreos/etcd:v3.5.5 | Milvus 元数据存储 |
+| minio | minio/minio | Milvus 对象存储 |
 
 > Milvus 还依赖 etcd 和 MinIO，首次启动要等 1–2 分钟。用 `docker compose ps` 检查健康状态。
 > `.env` 里的 `SPRING_DATASOURCE_URL` 主机名是 `mysql`（容器内网），与本地的 `localhost` 不同，别混用。
@@ -1064,8 +1066,8 @@ lsof -i :8083
 向量维度和空间都变了。必须清空向量库重新入库：
 
 ```bash
-# Chrome / Milvus：删数据卷
-docker compose -f docker-compose-chroma.yml down -v
+# Milvus：删数据卷
+docker compose down -v
 
 # InMemory：重启应用即可（本来就不持久化）
 ```
